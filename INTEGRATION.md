@@ -11,9 +11,49 @@ turned down upstream.
 - Every PR comes in as its own merge commit (`git log --first-parent`), so
   you can find, revert or leave out each one.
 - Before inclusion, every PR was built and tested on one Windows 11
-  machine (NVIDIA RTX 5070, 32-lane waves only; WARP). That machine has no
-  copy of the title. **Nobody has run this tree with the title yet.** It
-  makes no claim about results in the title.
+  machine (NVIDIA RTX 5070, 32-lane waves only; WARP). The title was not
+  used in these tests: the integration machine has not run this tree with
+  the title. **Nobody has run this tree with the title yet.** It makes no
+  claim about results in the title.
+- Update 3 adds #493, #483, #206, #469, #459, #454 and #579, and brings
+  the wave64 stack up to #439's head `965ce30`.
+
+## Reports from the title
+
+These are testers' own reports, from their own copies of the title and
+with other builds than this tree. They were not repeated here.
+
+- **A set without the world-entry GPU hang on three NVIDIA cards.**
+  Upstream `main` `d2a4bae` plus #493, #483, #189, #89, #205, #206, #469,
+  #459 and #454, diagnostics builds run with
+  `VICTORY_SHADER_LOOP_LIMIT=32`: no device removal on an RTX 5080
+  (Zignixx, 7 to 10 minutes per run), an RTX 3080 (SlopComp, 12.5 minutes
+  in the world) and an RTX 3070 (Vyral1978, about 14 minutes in the
+  world). The 3D scene was black in all of them. Upstream issue #71,
+  comments 7123097017, 7123060678 and 7123087811.
+- **How this tree differs from that set.** It has all of those PRs but
+  #189. In #189's place it carries the wave64 stack (#223, #233, #320,
+  #439, #180), which cannot be in one tree with #189, and it has the
+  other PRs listed below. It also keeps 2^18 dynamic descriptor slots on
+  a capped view heap, where that set had 2^16 (see "Changes made in this
+  branch"). So a run of this tree with `VICTORY_SHADER_LOOP_LIMIT=32`
+  tells whether the result still holds here. Nobody has made that run.
+- **If it hangs, try `VICTORY_SKIP_WAVE64=mesh,compute`** (#579,
+  diagnostics build). It leaves out draws and dispatches of mesh and
+  compute programs written for 64-lane waves, the compute programs the
+  wave64 stack translates among them. Testers report that the hang goes
+  away with it: an RTX 5070 Ti under vkd3d-proton (deadkid14, `d2a4bae` +
+  #177 + #454 + #579: a hang about 5 minutes after the world load
+  without the switch, more than 10 minutes in the world with it, one run
+  each; issue #71, comment 7122920254), an RTX 5090 (wbkepler, PR #579)
+  and an RTX 4080 (Proudnoob4, issue #71, comment 7123228803).
+  deadkid14 and Proudnoob4 also report a black screen in the world.
+- **#136 makes every frame black** (left out of this tree). Two testers
+  bisected it: on an RTX 5080 a build with it is black from the first
+  frame, loading screens included, and the build just before it shows
+  the loading art (Zignixx, issue #71, comment 7123097017); on an RTX
+  4080 `main` + #175 shows the loading art and adding #136 makes every
+  captured frame black (Proudnoob4, comment 7123145062).
 
 ## What is in this tree
 
@@ -34,8 +74,22 @@ and the name is its author's GitHub login.
 - #205 (asdaasdsaddf): null texture UAVs get the title's view dimension
 - #365 (FIocker): replay pending descriptors before publishing the host
   heap
-- #336 (hophaver): drop draws whose fresh tables cannot be made; 2^18
-  dynamic slots
+- #336 (hophaver), at `3c81420`: drop draws whose fresh tables cannot be
+  made; 2^18 dynamic slots. Its later commit `e8d3b64` (2^16 on a capped
+  heap) is not taken; see "Changes made in this branch".
+- #493 (hophaver), head `c48b240`: each root SRV is bound as a one-view
+  table of its buffer's host copy, so reads past the copy return zeros.
+  A root SRV whose address is not on 16 bytes reads zeros (logged once
+  as `a root SRV not on 16 bytes reads zeros`), and one used with no
+  view heap bound drops its draw. `VICTORY_ROOT_SRV_DIRECT=1` goes back
+  to root descriptors.
+- #483 (Vaximous), head `65a161d`: a heap index computed from data stays
+  inside the heap (an index at or past the heap's guard slot reads that
+  slot, which is null in a view heap)
+- #206 (AnoHunted), head `05981dd`: a structured buffer view that does
+  not start on an element of its host copy becomes a raw view of the
+  same bytes (a shader that indexes such a view reads it as structured,
+  which D3D12 leaves undefined)
 - #123 (9hvn9yt2vk-netizen): refuse raw buffer views that do not start
   on 16 bytes
 - #251 (tcurtsinger): free descriptor tables may span the search cursor
@@ -68,6 +122,9 @@ and the name is its author's GitHub login.
   instead of halving the value
 - #211 (Yaekai): composite several PresentX planes (Series S black UI and
   menus)
+- #469 (AnoHunted), head `c47c963`: a depth target that is also
+  unordered access gets that access through a twin texture, copied to
+  and from the depth in each list that uses it
 
 ### Shaders: instructions checked against AMD's ISA reference
 
@@ -75,7 +132,10 @@ and the name is its author's GitHub login.
   followed
 - #25 (artor410): packed typed-buffer formats decoded
 - #169 (Dufftwt): `tbuffer_load_format_d16` loads pack two 16-bit
-  channels per VGPR
+  channels per VGPR. Its test fails on the integration machine's AMD
+  Radeon integrated GPU, before and after update 3 (a 16-bit UNORM 1.0
+  comes out as the f16 `0x3BFF`, not `0x3C00`); it passes on the RTX
+  5070.
 - #276 (Dufftwt): `s_ttracedata_imm` is SOPP opcode 0x28
 - #168 (Dufftwt): SCC of `s_min`, `s_max` and `s_lshl1-4_add_u32` as the
   ISA sets it
@@ -112,6 +172,11 @@ and the name is its author's GitHub login.
   atomic is annotated twice
 - #286 (tarcisioads): accept known `D3D_MIN_PRECISION` signature
   elements
+- #459 (AnoHunted), head `dc838d6`: mesh output maxima come down to the
+  lane count when the outputs pass D3D12's 32 KiB. A tester measured
+  that it clears none of the 53 mesh programs over the cap in the
+  title's shaders, whose lane count is already the maximum (Proudnoob4,
+  upstream issue #201, comment 7122527604). It changes nothing for them.
 
 ### Shaders: image sampling
 
@@ -128,10 +193,14 @@ and the name is its author's GitHub login.
   console flow on hosts without 64-lane waves
 - #320 (r4tedx): lane reads and writes where lanes branch differently
   run in the console flow, on every host
-- #439 (r4tedx), head `e49302a`: one console wave sharing LDS runs in
+- #439 (r4tedx), head `965ce30`: one console wave sharing LDS runs in
   the console flow. It carries peter-bonanni's commit `9b73d66`
   ("carry whole-wave integer scans across two 32-lane waves"):
-  whole-wave sections across the two halves
+  whole-wave sections across the two halves. It also carries `416714c`
+  from Raxstreams's pull request r4tedx/VIctory#2 (git author Peter
+  Bonanni): `ds_bpermute_b32` reads within the lane's own 32-lane half.
+  Float whole-wave sums, minima and maxima cross the two halves
+  (`965ce30`).
 - #180 (permadiego), head `5ff639e`: twin descriptor loads, and quad
   gradients for compute samples
 
@@ -139,7 +208,10 @@ These come in together from the branch `integration/wave64-with-180` at
 `24b3bcc`, which merges #180 into #439's head. That commit has a single
 parent, so #180's changes are in it but its own commits are not. In
 this tree, the shader tests ran on the integration machine's RTX 5070
-and also on an AMD Radeon integrated GPU (64-lane waves).
+and also on an AMD Radeon integrated GPU (64-lane waves). #439's five
+commits after `e49302a` (`a32c177`, `8876ed3`, `416714c`, `f653ea4`,
+`965ce30`) were picked onto the tree in update 3, in two merge commits,
+and the shader tests ran again on both GPUs.
 
 **Validation failures, fixed by #180.** A whole-title
 `translate --validate` run found #320 adds 20 compute modules that fail
@@ -167,6 +239,17 @@ machines with newer drivers did not show it.
   it, `cargo test` sometimes never finishes, with several GPU tests stuck
   together. On the integration machine, before #433, 4 of 12 runs of the
   shader tests hung; with it, 0 of 12 did.
+
+### Switches that are off unless set
+
+- #454 (ruvenesh), head `d2c93fa`: with `VICTORY_NO_WATCHDOG` set (to any
+  value), the loader patches out the two places where the title's own
+  watchdog ends the process, in build 1.0.2.1 only. Without the variable
+  nothing changes.
+- #579 (wbkepler), head `1658c84`: in diagnostics builds,
+  `VICTORY_SKIP_WAVE64=<stage>,...` (`mesh`, `compute`, `vertex`,
+  `pixel`) omits draws and dispatches whose pipeline has a program of a
+  listed stage written for 64-lane waves
 
 ## Changes made in this branch
 
@@ -229,6 +312,49 @@ is described in its merge or fix commit.
   `lower::Parts` by hand, in `emit/lower.rs` (#307's `lower_wave`, #226's
   annotation test). `emit/mod.rs`: module order, with `split_tests`
   before `threading`.
+- **Dynamic slots on a capped view heap (#493 with #336's `e8d3b64`):**
+  #493 carries #336's later commit, which gives a view heap the host
+  caps (NVIDIA: 1,000,000 views, where the title asks for 1,310,720)
+  2^16 dynamic slots in place of 2^18, to mirror more of the title's
+  slots. That commit's sizing is not taken: a capped heap keeps 2^18, as
+  this tree had. The reason is one tester's measurement in the title on
+  an RTX 5080 (Zignixx, upstream issue #71, comment 7123097017, one run
+  per row): with 65,536 dynamic slots 22-30% of the requests for slots
+  were refused and about 1,680 mesh dispatches per frame were dropped;
+  with 262,144 none were, the peak in use was 132,014, and
+  `title slot past the host heap` never fired in a 7-minute run. A new
+  test, `a_capped_view_heap_keeps_its_dynamic_slots`, holds this. On the
+  integration machine the heap is capped at 737,855 title slots, 262,144
+  dynamic ones and the guard slot.
+- **#493 with #86 / #83 / #251 (`HostHeap`):** this tree's heap layout is
+  kept (the capped sampler heap with its dynamic slots, the free-table
+  search); from #493 only its own additions are taken.
+- **#493 with #334 (root SRV tables):** the host copy a root SRV table
+  views is moved to its read state, as #334 does for root views. #493
+  was written without #334's buffer states.
+- **#483 with #86 and #336 (the guard slot):** a view heap is one slot
+  larger, and that slot, after the dynamic ones and outside the pool
+  they are handed out from, is the guard (slot 999,999 on a capped
+  heap). #483 placed it by a constant; here the pool's size is the
+  heap's own (#86). A sampler heap's guard is its last slot with the
+  dynamic ones counted, not #483's last title slot, which would have
+  clamped away the sampler tables #86 makes in the dynamic slots. New
+  test: `the_guard_slot_is_past_every_dynamic_slot`.
+- **#483 with #307 (per-lane heap indices):** #307's per-lane heap
+  index, which #483 did not know, goes through #483's guard too.
+- **#483 with #160's tests:** the image tests fill the new guard dwords
+  (`emit/image_tests.rs`).
+- **#206 with #123:** #206's choice (on an element, raw view of the same
+  bytes, or refused) comes first, then #123's refusal of a raw view that
+  does not start on 16 bytes.
+- **#469 with #334 (`HostList`):** #334's buffer states and #469's twins
+  are both kept. When a list closes, the twins are copied back first,
+  then the buffers go back to the common state.
+- **#459's tests:** moved to the `tests` module of `emit/mod.rs` (git had
+  put them in #48's `atomic_tests`), with #223's `Target` argument.
+- **#439's new commits with #180:** in `Lower::new`, the instructions
+  that read lanes of the same half are #180's implicit-derivative
+  samples and `416714c`'s `ds_bpermute_b32`, both.
 
 ## Left out on purpose
 
@@ -238,7 +364,10 @@ is described in its merge or fix commit.
   which returns 0 on NVIDIA; a title run with it (and other PRs) ended in
   a 0x887A0001 device removal
 - #136: a16 bias read as f32; `image_gather4_l` ignores the sampler's
-  address mode; 31 `E_OUTOFMEMORY` refusals in a title run
+  address mode; 31 `E_OUTOFMEMORY` refusals in a title run. Two testers
+  have since bisected it as making every frame black, loading screens
+  included (Zignixx on an RTX 5080 and Proudnoob4 on an RTX 4080,
+  upstream issue #71, comments 7123097017 and 7123145062)
 - #317: MSAA descriptors report 1 sample instead of log2(samples)
 - #269: its new tests fail on 32-lane hosts (NVIDIA)
 - #318: a16 also packs derivatives, which the hardware does not
@@ -273,12 +402,22 @@ is described in its merge or fix commit.
   (updated upstream since, not re-reviewed)
 - #367: closed as a duplicate of #334
 - #159 (r4tedx): needs adapting to #334's state tracker first
+- #189 (alfycs): another way to run wave64 compute on 32-lane hosts. It
+  and the wave64 stack in this tree (#223, #233, #320, #439) change the
+  same lowering and cannot be in one tree.
+- #578 (wbkepler): refuses every wave64 mesh and compute program on
+  hosts without 64-lane waves, the compute programs the wave64 stack
+  translates among them. #579's switch (included) does the same on
+  request.
 
 ## What this tree is NOT expected to fix
 
-- **The world hang itself.** In-game runs of #334 still ended in
-  `DXGI_ERROR_DEVICE_HUNG`, and nothing reviewed has been shown to stop
-  the hang. This tree removes known errors around it, not the hang.
+- **The world hang itself is not known to be fixed here.** In-game runs
+  of #334 still ended in `DXGI_ERROR_DEVICE_HUNG`. Testers report no
+  hang with another set of PRs (see "Reports from the title"); whether
+  this tree behaves the same has not been run.
+- **The black 3D scene.** The runs without a hang still showed a black
+  scene in the world.
 - **The top rows of issue #293's table** ("an address in an SGPR that is
   no root parameter", "a descriptor neither loaded nor built", "a
   structured buffer of unknown stride", "a scalar memory read as data").
@@ -324,6 +463,12 @@ Please include:
 - **Any `nvgpucomp64.dll` first-chance exception or `E_OUTOFMEMORY`
   pipeline refusal**, with the shader hash from the log.
 - **Whether the world shows geometry**, in words.
+- **The variables you set**: `VICTORY_SHADER_LOOP_LIMIT`,
+  `VICTORY_SKIP_WAVE64`, `VICTORY_NO_WATCHDOG`, `VICTORY_ROOT_SRV_DIRECT`.
+- **These log lines, if they appear**: `a root SRV not on 16 bytes reads
+  zeros`, `a root SRV without a bound view heap`, `title slot past the
+  host heap` (with its highest index), and the `dropped=` count of
+  `a draw or dispatch dropped: no dynamic slots for its tables`.
 - Which PRs you left out or added, if you changed the tree.
 
 Post **counts and messages only**. Never post game files, shader dumps,
