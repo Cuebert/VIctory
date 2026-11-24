@@ -464,11 +464,12 @@ fn one_wave_shares_lds_in_instruction_order() {
 /// half's read of the lower half's dword can come first. Lane t writes t to
 /// dword t and reads dword 63 - t.
 ///
-/// On an RTX 5070 both LDS tests also pass with the barrier before each LDS
-/// access left out: that card keeps the two waves in step for these
-/// programs. They check that the form gives the console's result, not that
-/// the barrier is what gives it; D3D12 promises no order between a group's
-/// waves without one.
+/// On an RTX 5070 this test and the one above also pass with the barrier
+/// before each LDS access left out: that card keeps the two waves in step
+/// for these programs. They check that the form gives the console's result,
+/// not that the barrier is what gives it; D3D12 promises no order between a
+/// group's waves without one. `lds_written_and_read_in_different_masked_blocks`
+/// has a case that does fail without it.
 #[test]
 fn lds_order_holds_when_one_half_is_busy() {
     let mut body = vec![
@@ -658,4 +659,189 @@ fn whole_wave_sections_in_partial_groups_still_stop() {
             "{threads} threads"
         );
     }
+}
+
+/// One console wave whose LDS write and read sit in different exec-masked
+/// blocks (the pattern measured on upstream PR #189): lanes write dword t,
+/// then lanes 0..31 read dword t + 32 in a later masked block. The console
+/// runs the wave in lockstep, so the read sees the write.
+///
+/// `delay` has only lanes 32..63 write, after 4096 iterations of a
+/// scalar-counted loop in their own masked block, so a lower half that was
+/// not held back would read first.
+///
+/// In the console flow both halves are in step here twice over: a branch on
+/// EXEC is decided by both halves through an exchange, which is a group
+/// barrier, and each LDS access has a group barrier before it. So these two
+/// also pass on an RTX 5070 with the second left out; the case without
+/// branches in the test below does not.
+fn lds_across_masked_blocks(delay: bool) -> Vec<u32> {
+    let mut body = vec![
+        0x7E04_0287, // v_mov_b32 v2, 7
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0x4A0A_0087, // v_add_nc_u32 v5, 7, v0
+    ];
+    if delay {
+        body.extend_from_slice(&[
+            0x7D82_009F, // v_cmp_lt_u32 vcc, 31, v0
+            0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+            0xBF88_000A, // s_cbranch_execz join
+            0xBE89_0380, // s_mov_b32 s9, 0
+            // loop:
+            0x160A_0AFF,
+            40503,       // v_mul_u32_u24 v5, 40503, v5
+            0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5
+            0x8109_8109, // s_add_i32 s9, s9, 1
+            0xBF0A_FF09,
+            4096,        // s_cmp_lt_u32 s9, 4096
+            0xBF85_FFF9, // s_cbranch_scc1 loop
+            0xD834_0000,
+            0x0000_0504, // ds_write_b32 v4, v5
+            // join:
+            0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        ]);
+    } else {
+        body.extend_from_slice(&[
+            0xD834_0000,
+            0x0000_0504, // ds_write_b32 v4, v5
+        ]);
+    }
+    body.extend_from_slice(&[
+        0x7D88_00A0, // v_cmp_gt_u32 vcc, 32, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0002, // s_cbranch_execz join
+        0xD8D8_0080,
+        0x0200_0004, // ds_read_b32 v2, v4 offset:128
+        // join:
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ]);
+    body
+}
+
+#[test]
+fn lds_written_and_read_in_different_masked_blocks() {
+    program_case(
+        "LDS written by every lane, then read by the lower half",
+        &program_lds(&lds_across_masked_blocks(false), 64),
+        |t| if t < 32 { t + 39 } else { 7 },
+        true,
+    );
+    // What a writer leaves: 4096 times v = v_mul_u32_u24(40503, v) + 1.
+    let late = |t: u32| {
+        (0..4096).fold(t + 7, |v, _| {
+            (v & 0xFF_FFFF).wrapping_mul(40503).wrapping_add(1)
+        })
+    };
+    program_case(
+        "LDS written late by the upper half, then read by the lower",
+        &program_lds(&lds_across_masked_blocks(true), 64),
+        |t| if t < 32 { late(t + 32) } else { 7 },
+        true,
+    );
+    // The same masks with no branch around either access: nothing but the
+    // barrier before each LDS access orders the halves. With it left out,
+    // the lower half of an RTX 5070 reads 0 here every time (20 of 20 runs):
+    // this is the case that shows the barrier is needed.
+    let masked = [
+        0x7E04_0287, // v_mov_b32 v2, 7
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0x4A0A_0087, // v_add_nc_u32 v5, 7, v0
+        0x7D82_009F, // v_cmp_lt_u32 vcc, 31, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xD834_0000,
+        0x0000_0504, // ds_write_b32 v4, v5
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0x7D88_00A0, // v_cmp_gt_u32 vcc, 32, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xD8D8_0080,
+        0x0200_0004, // ds_read_b32 v2, v4 offset:128
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ];
+    program_case(
+        "LDS written by the upper half and read by the lower, no branches",
+        &program_lds(&masked, 64),
+        |t| if t < 32 { t + 39 } else { 7 },
+        true,
+    );
+}
+
+#[test]
+fn backward_permute_wraps_within_each_half() {
+    let body = [0x3406_0082, 0xDACC_0004, 0x0200_0003];
+    console_flow_case("backward permute", &body, 64, |lane| {
+        (lane & !31) | ((lane + 1) & 31)
+    });
+}
+
+#[test]
+fn backward_permute_respects_both_exec_masks() {
+    let body = [
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xDACC_0004,
+        0x0200_0003, // ds_bpermute_b32 v2, v3, v0 offset:4
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ];
+    console_flow_case("masked backward permute", &body, 64, |lane| match lane {
+        0..19 => lane + 1,
+        19 => 0,
+        _ => 1,
+    });
+}
+
+/// `ds_bpermute_b32` where lane t reads v0 of lane t + 1 of its half, in the
+/// masks, group sizes and forms the two tests above leave out.
+#[test]
+fn backward_permute_in_other_masks_groups_and_forms() {
+    let next = |t: u32| (t & !31) | ((t + 1) & 31);
+    // EXEC over part of each half: lanes 0..21 and 42..63.
+    let straddle = [
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0x4A02_0096, // v_add_nc_u32 v1, 22, v0
+        0x3602_02BF, // v_and_b32 v1, 63, v1
+        0x7D88_02AC, // v_cmp_gt_u32 vcc, 44, v1
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xDACC_0004,
+        0x0200_0003, // ds_bpermute_b32 v2, v3, v0 offset:4
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ];
+    let active = |t: u32| !(22..42).contains(&t);
+    console_flow_case(
+        "backward permute under a mask over both halves",
+        &straddle,
+        64,
+        |t| match (active(t), active(next(t))) {
+            (false, _) => 1,
+            (true, true) => next(t),
+            (true, false) => 0,
+        },
+    );
+    let plain = [
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0xDACC_0004,
+        0x0200_0003, // ds_bpermute_b32 v2, v3, v0 offset:4
+    ];
+    // Two console waves per group, then a group whose upper half has 16
+    // lanes (a source lane that is not there reads 0), then one half only.
+    console_flow_case("backward permute, two console waves", &plain, 128, next);
+    console_flow_case("backward permute, 48 threads", &plain, 48, |t| {
+        if next(t) < 48 { next(t) } else { 0 }
+    });
+    console_flow_case("backward permute, 32 threads", &plain, 32, next);
+    // Beside a lane read across the halves, which takes the console flow on
+    // a host without 64-lane waves.
+    let with_read = [
+        0x3406_0082, // v_lshlrev_b32 v3, 2, v0
+        0xDACC_0004,
+        0x0200_0003, // ds_bpermute_b32 v2, v3, v0 offset:4
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x4A04_0409, // v_add_nc_u32 v2, s9, v2
+    ];
+    console_flow_case("backward permute beside a lane read", &with_read, 64, |t| {
+        next(t) + 40
+    });
 }
