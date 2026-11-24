@@ -683,6 +683,57 @@ fn texel_offsets_and_levels_sample_the_texels_they_name() {
     );
 }
 
+/// A gather at a level only known at run time reads that level's
+/// footprint, in gather order, through the sampler's own address mode:
+/// clamped at the edges with a clamp sampler, wrapped with a wrap sampler.
+#[test]
+fn gathers_at_a_run_time_level_read_that_levels_footprint() {
+    let Some(host) = host() else { return };
+    let ow = offset_word;
+    // Lane l: level n = l mod 3, the footprint whose lower texel is (x, y)
+    // of that level, moved by (dx, dy); `edge` maps a texel index into the
+    // level. Blue is x + 8y + 100n.
+    let lane = |l: usize, (dx, dy): (i32, i32), edge: fn(i32, i32) -> i32| {
+        let n = (l % 3) as u32;
+        let s = (W >> n) as i32;
+        let (x, y) = ((l / 3) as i32 % s, (l / 7) as i32 % s);
+        let (u, v) = ((x + 1) as f32 / s as f32, (y + 1) as f32 / s as f32);
+        let blue = |i: i32, j: i32| {
+            f((edge(i + dx, s) + 8 * edge(j + dy, s) + 100 * n as i32) as f32)
+        };
+        let want = [blue(x, y + 1), blue(x + 1, y + 1), blue(x + 1, y), blue(x, y)];
+        (n, (u, v), want)
+    };
+    let clamp: fn(i32, i32) -> i32 = |i, s| i.clamp(0, s - 1);
+    let wrap: fn(i32, i32) -> i32 = |i, s| i.rem_euclid(s);
+    let cases = |edge: fn(i32, i32) -> i32| {
+        [
+            case("gather4_l blue", mimg("image_gather4_l", 4), &[], move |l| {
+                let (n, (u, v), want) = lane(l, (0, 0), edge);
+                ([f(u), f(v), f(n as f32)].to_vec(), want)
+            }),
+            case(
+                "gather4_l_o blue per lane",
+                mimg("image_gather4_l_o", 4),
+                &[],
+                move |l| {
+                    let o = lane_offset(l);
+                    let (n, (u, v), want) = lane(l, o, edge);
+                    ([ow(o.0, o.1), f(u), f(v), f(n as f32)].to_vec(), want)
+                },
+            ),
+        ]
+    };
+    let t = leak(level_texels());
+    check(&host, &cases(clamp), || View::Levels(W, W, LEVELS, t), point(false));
+    let wrapping = D3D12_SAMPLER_DESC {
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+        ..point(false)
+    };
+    check(&host, &cases(wrap), || View::Levels(W, W, LEVELS, t), wrapping);
+}
+
 #[test]
 fn comparisons_and_comparison_gathers_match_per_texel_comparisons() {
     let Some(host) = host() else { return };
@@ -1069,12 +1120,6 @@ fn forms_without_an_sm_6_6_equivalent_name_why() {
             true,
             false,
             "a gather with a level bias",
-        ),
-        (
-            "image_gather4_l",
-            false,
-            false,
-            "a gather at a level not known to be 0",
         ),
         (
             "image_gather4_c_l_o",

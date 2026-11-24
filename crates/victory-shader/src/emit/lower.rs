@@ -336,6 +336,10 @@ struct SampleForm {
     o: bool,
 }
 
+/// Not a DXIL operation: a gather at a level known only at run time, made
+/// of four samples (`Lower::image`).
+const GATHER_AT_LEVEL: u32 = 1 << 16;
+
 fn sample_form(name: &str) -> Option<SampleForm> {
     let (gather, rest) = match name.strip_prefix("image_sample") {
         Some(rest) => (false, rest),
@@ -5518,6 +5522,8 @@ impl<'a> Lower<'a> {
         let h = self.handle(site, src, false, props)?;
         let fu = self.s.m.undef(self.s.t.f32);
         let iu = self.s.m.undef(self.s.t.i32);
+        // The four texels of a gather made of samples (`GATHER_AT_LEVEL`).
+        let mut gathered: Option<[V; 4]> = None;
         let r = if sample {
             let ss = self
                 .descriptors
@@ -5615,16 +5621,21 @@ impl<'a> Lower<'a> {
                 if !f.l && !f.lz {
                     return Err("a gather with implicit level");
                 }
-                if !level_zero {
-                    return Err("a gather at a level not known to be 0");
-                }
                 if dmask.count_ones() != 1 {
                     return Err("a gather of several channels");
                 }
                 if !matches!(kind, 2 | 5 | 7) {
                     return Err("a gather from a 1D or 3D image");
                 }
-                if f.c { 74 } else { 73 }
+                if level_zero {
+                    if f.c { 74 } else { 73 }
+                } else if f.c || kind == 5 {
+                    // A comparison's function is in the sampler, and a cube's
+                    // texel grid is per face.
+                    return Err("a gather at a level not known to be 0");
+                } else {
+                    GATHER_AT_LEVEL
+                }
             } else if f.c {
                 if f.d {
                     return Err("a comparison sample with explicit derivatives");
@@ -5838,6 +5849,87 @@ impl<'a> Lower<'a> {
                     self.s
                         .op(c, name, Attr::ReadOnly, self.s.t.res_ret, op, &args)
                 }
+                GATHER_AT_LEVEL => {
+                    // A gather at a level the code computes. DXIL's gathers
+                    // read level 0 only, so the four texels of the footprint
+                    // are sampled one by one at their centres at that level:
+                    // at a texel's centre every filter returns that texel,
+                    // and the sampler applies its own address mode and level
+                    // range, as it does for the console's gather.
+                    // shortcut: the footprint is that of the level rounded to
+                    // the nearest whole one and clamped to the view's; a
+                    // sampler whose LOD bias or range moves the sampled level
+                    // off it reads another grid.
+                    let lod = float(self, coord_at(coords))?;
+                    let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+                    let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+                    let d0 = self
+                        .s
+                        .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, zero]);
+                    let levels = self.s.m.extract(c, d0, 3);
+                    let one = self.s.m.i32(1);
+                    let last = self.s.m.bin(c, Bin::Sub, levels, one);
+                    let li = self.unary(26, lod);
+                    let li = self.s.m.cast(c, Cast::FpToSi, li, i32t);
+                    let over = self.s.m.cmp(c, pred::SGT, li, last);
+                    let li = self.s.m.select(c, over, last, li);
+                    let under = self.s.m.cmp(c, pred::SLT, li, zero);
+                    let li = self.s.m.select(c, under, zero, li);
+                    let d = self
+                        .s
+                        .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, li]);
+                    let level = self.s.m.cast(c, Cast::SiToFp, li, f32t);
+                    let half = self.s.m.f32(0.5f32.to_bits());
+                    // The footprint's lower texel, floor(u * size - 0.5),
+                    // moved by the texel offsets.
+                    let mut size = [fu; 2];
+                    let mut low = [fu; 2];
+                    for k in 0..2 {
+                        let n = self.s.m.extract(c, d, k as u32);
+                        let n = self.s.m.cast(c, Cast::UiToFp, n, f32t);
+                        let t = self.s.m.bin(c, Bin::Mul, cs[k], n);
+                        let t = self.s.m.bin(c, Bin::Sub, t, half);
+                        let t = self.unary(27, t);
+                        let o = self.s.m.cast(c, Cast::SiToFp, os[k], f32t);
+                        low[k] = self.s.m.bin(c, Bin::Add, t, o);
+                        size[k] = n;
+                    }
+                    let mut none = vec![iu; 3];
+                    for o in none.iter_mut().take(offsets) {
+                        *o = zero;
+                    }
+                    let channel = dmask.trailing_zeros();
+                    let mut last_r = None;
+                    let mut texels = [fu; 4];
+                    // The console's (and DXIL's) gather order.
+                    for (n, by) in [(0.0f32, 1.0f32), (1.0, 1.0), (1.0, 0.0), (0.0, 0.0)]
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let mut at = cs.clone();
+                        for (k, step) in [by.0, by.1].into_iter().enumerate() {
+                            let centre = self.s.m.f32((step + 0.5).to_bits());
+                            let x = self.s.m.bin(c, Bin::Add, low[k], centre);
+                            at[k] = self.s.m.bin(c, Bin::SDiv, x, size[k]);
+                        }
+                        let mut a = vec![h, sh];
+                        a.extend(&at);
+                        a.extend(&none);
+                        a.push(level);
+                        let r = self.s.op(
+                            c,
+                            "sampleLevel.f32",
+                            Attr::ReadOnly,
+                            self.s.t.res_ret,
+                            62,
+                            &a,
+                        );
+                        texels[n] = self.s.m.extract(c, r, channel);
+                        last_r = Some(r);
+                    }
+                    gathered = Some(texels);
+                    last_r.expect("four samples")
+                }
                 62 => {
                     let lod = if f.l {
                         float(self, coord_at(coords))?
@@ -5905,7 +5997,10 @@ impl<'a> Lower<'a> {
         };
         let mut xs = Vec::new();
         for ch in channels {
-            let x = self.s.m.extract(c, r, ch);
+            let x = match gathered {
+                Some(texels) => texels[ch as usize],
+                None => self.s.m.extract(c, r, ch),
+            };
             xs.push(if *d16 {
                 // shortcut: d16 results are taken as floats (rounded to
                 // nearest even); integer formats would keep 16 bits.
