@@ -16,7 +16,7 @@ turned down upstream.
   the title. **Nobody has run this tree with the title yet.** It makes no
   claim about results in the title.
 - Update 3 adds #493, #483, #206, #469, #459, #454 and #579, and brings
-  the wave64 stack up to #439's head `d2189ff`.
+  the wave64 stack up to #439's head `901eef9`.
 
 ## Reports from the title
 
@@ -205,7 +205,7 @@ and the name is its author's GitHub login.
   console flow on hosts without 64-lane waves
 - #320 (r4tedx): lane reads and writes where lanes branch differently
   run in the console flow, on every host
-- #439 (r4tedx), head `d2189ff`: one console wave sharing LDS runs in
+- #439 (r4tedx), head `901eef9`: one console wave sharing LDS runs in
   the console flow. It carries peter-bonanni's commit `9b73d66`
   ("carry whole-wave integer scans across two 32-lane waves"):
   whole-wave sections across the two halves. It also carries `416714c`
@@ -224,7 +224,10 @@ and also on an AMD Radeon integrated GPU (64-lane waves). #439's five
 commits after `e49302a` (`a32c177`, `8876ed3`, `416714c`, `f653ea4`,
 `965ce30`) were picked onto the tree in update 3, in two merge commits,
 and its docs-only commit `2467891` and test-only commit `e6936e3` after them,
-then `d2189ff` (compute selects take masks held as numbers),
+then `d2189ff` (compute selects take masks held as numbers), `9e98b2b`
+(by ifBars, from pull request r4tedx/VIctory#6: the inputs of console
+mask joins carried around a loop are resolved after the first walk) and
+`901eef9` (its test runs on every hardware adapter),
 and the shader tests ran again on both GPUs.
 
 **Validation failures, fixed by #180.** A whole-title
