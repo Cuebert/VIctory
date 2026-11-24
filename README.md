@@ -1,5 +1,17 @@
 # VIctory
 
+## Windows cell tutorial trial
+
+On November 24, 2026, this branch reached the opening prison cell on Windows 11 with a GeForce RTX 5090. The game read both controller sticks. Two forward and reverse walks moved nearby objects farther across the screen than the far door. Turning the camera and looking back returned the view to its starting position. These measurements come from an intermediate game render target.
+
+The ordinary game window showed “Approach a cellmate to interact with them” and later “Go with the prison guard.” The guard objective appeared between input trials. The room on the ordinary display stayed nearly black. Completing an interaction, seeing a properly lit character, and measuring sustained gameplay FPS are still open. The journal labels the ordinary frame and the grayscale indirect-lighting image separately. [Cell trial and frame evidence](https://cuebert.github.io/gta6-progress/evidence.html#cell-trial)
+
+The tested source is `47ad88868402740c1d4c40b32f25b31f03228fe3`. Use the Windows setup below and build with `cargo build --locked --profile diag -p victory --features diagnostics --bin victory`. The reported run used `VICTORY_PARTIAL_TEXTURES=1`, `VICTORY_RETAINED_RESET=1`, and `VICTORY_SHADER_LOOP_LIMIT=32`.
+
+This branch builds on the work of the VIctory contributors and the public tester branch. The upstream status further down describes the earlier baseline. [VIctory](https://github.com/Marvisak/VIctory) · [Tester baseline](https://github.com/r4tedx/VIctory/commit/d6897facd92d6dd7f1a0d5177cf84e3d95a4951b) · [PR 641](https://github.com/Marvisak/VIctory/pull/641) · [PR 953](https://github.com/Marvisak/VIctory/pull/953) · [PR 1012](https://github.com/Marvisak/VIctory/pull/1012) · [PR 1020](https://github.com/Marvisak/VIctory/pull/1020) · [PR 1198](https://github.com/Marvisak/VIctory/pull/1198)
+
+## Upstream overview
+
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files
 the user supplies.
 
