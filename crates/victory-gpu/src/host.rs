@@ -5,7 +5,7 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -1535,6 +1535,78 @@ static CARD_PASSES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atom
 fn wide_merge() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_WIDE_MERGE").is_some_and(|v| v == "1"))
+}
+
+// Measure adjacent readback copies in the same running scene. Each piece still has
+// its own CPU merge and completion record regardless of how its bytes came down.
+static JOIN_FETCHES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FETCH_COUNTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn poll_fetch_mode() {
+    use std::io::Read;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("VICTORY_FETCH_TRIAL").is_some_and(|v| v == "1")) {
+        return;
+    }
+    let Some(folder) = crate::capture::folder() else { return };
+    let Ok(mut file) = std::fs::File::open(folder.join("fetch-mode.txt")) else { return };
+    let mut byte = [0u8; 1];
+    if file.read_exact(&mut byte).is_err() || !matches!(byte[0], b'0' | b'1') {
+        return;
+    }
+    let enabled = byte[0] == b'1';
+    if JOIN_FETCHES.swap(enabled, Ordering::Relaxed) != enabled {
+        tracing::info!(enabled, "changed adjacent readback copies");
+    }
+}
+
+/// Each index names one retained Shadow in the submission. Coalescing requires
+/// contiguity in both buffers, with no command between consecutive copies.
+fn record_fetches(
+    pieces: &[(usize, usize, usize, u64)],
+    join: bool,
+    mut copy: impl FnMut(usize, usize, usize, u64),
+) -> usize {
+    if !join {
+        for &(source, lo, hi, at) in pieces {
+            copy(source, lo, hi, at);
+        }
+        return pieces.len();
+    }
+    let mut count = 0;
+    let mut next = pieces.iter().copied().peekable();
+    while let Some((source, first, mut end, destination)) = next.next() {
+        while let Some(&(other, lo, hi, at)) = next.peek() {
+            if source != other || end != lo || destination.checked_add((end - first) as u64) != Some(at) {
+                break;
+            }
+            end = hi;
+            let _ = next.next();
+        }
+        copy(source, first, end, destination);
+        count += 1;
+    }
+    count
+}
+
+#[cfg(test)]
+#[test]
+fn adjacent_readback_commands_preserve_every_destination_byte() {
+    let sources = [[1,2,3,4,5,6,7,8], [11,12,13,14,15,16,17,18]];
+    let pieces = [(0,0,2,1), (0,2,5,3), (0,5,7,6), (1,0,2,8),
+                  (1,3,4,10), (1,4,6,13), (1,5,8,15)];
+    let mut reference = [0xabu8; 21];
+    let mut joined = reference;
+    for (mode, out) in [(false, &mut reference), (true, &mut joined)] {
+        let recorded = record_fetches(&pieces, mode, |id, lo, hi, at| {
+            let at = at as usize;
+            out[at..at+hi-lo].copy_from_slice(&sources[id][lo..hi]);
+        });
+        assert_eq!(recorded, if mode { 5 } else { 7 });
+    }
+    assert_eq!(joined, reference);
+    assert_eq!((joined[0], joined[11], joined[12], joined[18]), (0xab,0xab,0xab,0xab));
 }
 
 /// One declared range of a copy in the card's memory, in a submission.
@@ -3556,9 +3628,11 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
-                    for &(i, lo, hi, at) in &pieces {
+                    let copies = record_fetches(&pieces, JOIN_FETCHES.load(Ordering::Relaxed), |i, lo, hi, at| {
                         list.CopyBufferRegion(fetched, at, &plan.ranges[i].shadow.buffer, lo as u64, (hi - lo) as u64);
-                    }
+                    });
+                    FETCH_COUNTS[0].fetch_add(pieces.len() as u64, Ordering::Relaxed);
+                    FETCH_COUNTS[1].fetch_add(copies as u64, Ordering::Relaxed);
                     list.Close()?;
                     self.queue.ExecuteCommandLists(&[Some(list.cast()?)]);
                     self.card_sent();
@@ -5755,6 +5829,11 @@ impl Meter {
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+        if std::env::var_os("VICTORY_FETCH_TRIAL").is_some() {
+            let [pieces, copies] = [0, 1].map(|i| FETCH_COUNTS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            tracing::info!(joined = JOIN_FETCHES.load(Ordering::Relaxed), pieces_per_frame = pieces,
+                           copies_per_frame = copies, "synchronous readback copy commands");
+        }
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -5784,7 +5863,7 @@ impl Meter {
                      the draws that read them through tables, {} writes of tables' slots (due some frames later), {} slots taken out \
                      as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
                      {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
-                     {} ranges of memory mapped, unmapped or written under texture views ({} dropped), {} slots made due by them, \
+                     {} ranges of memory mapped, unmapped or written under texture views ({} entries reached the journal cap), {} slots made due by them, \
                      {} made slots found unmapped and made null",
                     crate::draw::HEAP_TEXTURES_TABLED.load(Ordering::Relaxed),
                     crate::descriptor::host::TABLED_WRITES[0].load(Ordering::Relaxed),

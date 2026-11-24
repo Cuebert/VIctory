@@ -178,18 +178,86 @@ impl Spans {
     }
 
     /// The slots whose texture's memory overlaps `[start, end)`.
+    #[cfg(test)]
     fn slots_in(&self, start: u64, end: u64) -> Vec<u32> {
-        self.overlapping(start, end)
-            .iter()
-            .filter_map(|at| self.by_start.get(at))
-            .flat_map(|span| span.1.iter().copied())
-            .collect()
+        let mut out = Vec::new();
+        self.append_slots(start, end, &mut out);
+        out
+    }
+
+    fn append_slots(&self, start: u64, end: u64, out: &mut Vec<u32>) {
+        let preceding = self.by_start.range(..start).next_back().filter(|(_, span)| span.0 > start);
+        for (_, (_, slots)) in preceding.into_iter().chain(self.by_start.range(start..end)) {
+            out.extend(slots.iter().copied());
+        }
     }
 }
 
 /// Title memory the runtime mapped, unmapped or is about to write since a
 /// texture pass last took the ranges ([`remapped`]).
-static REMAPPED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+static REMAPPED: Mutex<Remaps> = Mutex::new(Remaps::new());
+
+const MAX_REMAPS: usize = 1 << 15;
+type AddressRange = (u64, u64);
+
+/// Preserve the old journal's range boundary so restored slots can be counted
+/// exactly. No GPU resource or title allocation is held by the journal.
+struct Remaps {
+    recent: Vec<AddressRange>,
+    older: Vec<AddressRange>,
+    all_placed: bool,
+}
+
+impl Remaps {
+    const fn new() -> Self {
+        Self { recent: Vec::new(), older: Vec::new(), all_placed: false }
+    }
+
+    fn push(&mut self, start: u64, end: u64, retain: bool) -> usize {
+        if start >= end { return 0; }
+        if let Some(last) = self.recent.last_mut() && last.1 == start {
+            last.1 = end;
+            return 0;
+        }
+        let mut rolled = 0;
+        if self.recent.len() >= MAX_REMAPS {
+            rolled = self.recent.len();
+            if retain && !self.all_placed {
+                self.older.append(&mut self.recent);
+                coalesce_remaps(&mut self.older);
+                if self.older.len() > MAX_REMAPS {
+                    // Bounded fallback: recheck only current placed texture slots
+                    // through their ordinary view/residency and upload paths.
+                    self.older.clear();
+                    self.all_placed = true;
+                }
+            }
+            self.recent.clear();
+        }
+        self.recent.push((start, end));
+        rolled
+    }
+}
+
+fn coalesce_remaps(ranges: &mut Vec<AddressRange>) {
+    ranges.sort_unstable();
+    let mut n = 0;
+    for i in 0..ranges.len() {
+        let (from, to) = ranges[i];
+        if n != 0 && from <= ranges[n - 1].1 {
+            ranges[n - 1].1 = ranges[n - 1].1.max(to);
+        } else {
+            ranges[n] = (from, to);
+            n += 1;
+        }
+    }
+    ranges.truncate(n);
+}
+
+fn retain_remaps() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RETAIN_TEXTURE_REMAPS").is_some_and(|v| v == "1"))
+}
 
 /// The lowest start and the highest end of any span of [`Spans`] so far
 /// (the start is `u64::MAX` until there is one): what the runtime does to
@@ -201,7 +269,7 @@ static SPANNED: [std::sync::atomic::AtomicU64; 2] = [
 
 /// Since the start: slots whose view a newer view of other memory there
 /// made stale; ranges of memory noted as mapped, unmapped or written;
-/// ranges dropped because no pass took them; slots made due by such
+/// range entries that reached the journal cap; slots made due by such
 /// ranges; and made slots whose memory was found unmapped (made null).
 pub(crate) static STALE: [std::sync::atomic::AtomicU64; 5] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 5];
@@ -221,28 +289,14 @@ fn stale_out() -> bool {
 /// locks held: this locks one mutex of its own and calls nothing.
 pub(crate) fn remapped(at: usize, len: usize) {
     use std::sync::atomic::Ordering::Relaxed;
-    /// Ranges kept until a pass takes them.
-    const MOST: usize = 1 << 15;
     let (start, end) = (at as u64, at.saturating_add(len) as u64);
     if end <= SPANNED[0].load(Relaxed) || start >= SPANNED[1].load(Relaxed) {
         return;
     }
     let mut ranges = REMAPPED.lock().unwrap_or_else(|e| e.into_inner());
     STALE[1].fetch_add(1, Relaxed);
-    // Pages are mapped one after the other.
-    if let Some(last) = ranges.last_mut()
-        && last.1 == start
-    {
-        last.1 = end;
-        return;
-    }
-    if ranges.len() >= MOST {
-        // No pass runs (no shader that picks textures by index is bound):
-        // the slots there are looked at when they are due, as before.
-        STALE[2].fetch_add(ranges.len() as u64, Relaxed);
-        ranges.clear();
-    }
-    ranges.push((start, end));
+    let rolled = ranges.push(start, end, retain_remaps());
+    if rolled != 0 { STALE[2].fetch_add(rolled as u64, Relaxed); }
 }
 
 /// Frames for which a slot a draw read through a table counts as a table's
@@ -276,6 +330,8 @@ fn tabled_out() -> bool {
 /// What the queue of textures picked by index knows of a title slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Waiting {
+    /// 1: only a retained exact interval selected this write; 2: conservative overflow rescan.
+    overflow: u8,
     /// The frame from which the slot is due.
     due: u64,
     /// The frame it was written in.
@@ -311,7 +367,7 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0 });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, overflow: 0 });
     }
 
     fn remove(&mut self, index: u32) {
@@ -386,11 +442,11 @@ impl TextureQueue {
     /// written in `frame`: the slot is looked at from frame `due` as one
     /// written now, whatever was known of it (a pass at work on it does
     /// not take it out).
-    fn changed(&mut self, index: u32, frame: u64, due: u64) {
+    fn changed(&mut self, index: u32, frame: u64, due: u64, overflow: u8) {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0 });
+        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, overflow });
     }
 
     /// Bytes of slot `index`'s memory that were mapped at its last upload
@@ -799,7 +855,23 @@ impl HostHeap {
     /// that many bytes of its memory there, not all), or not until the
     /// slot is written again.
     pub(crate) fn texture_slot_done(&self, index: u32, write: u64, again: Option<(u64, u64)>) {
+        self.finish_texture(index, write, again, 0);
+    }
+
+    pub(crate) fn finish_texture(&self, index: u32, write: u64, again: Option<(u64, u64)>, staged_bytes: u64) {
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = textures.same(index, write)
+            && entry.overflow != 0 && staged_bytes != 0
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static OBSERVED: AtomicU64 = AtomicU64::new(0);
+            let count = OBSERVED.fetch_add(1, Ordering::Relaxed) + 1;
+            if count <= 12 || count.is_power_of_two() {
+                tracing::info!(slot=index, generation=write, staged_bytes, conservative=entry.overflow == 2,
+                    count, "staged texture selected only by retained invalidation");
+            }
+            entry.overflow = 0;
+        }
         match again {
             Some((frame, mapped)) => textures.partly(index, write, frame, mapped),
             None => textures.done(index, write),
@@ -832,20 +904,44 @@ impl HostHeap {
     /// whose pass runs first takes them (a title has one view heap).
     pub(crate) fn texture_slots_remapped(&self, frame: u64) -> usize {
         use std::sync::atomic::Ordering::Relaxed;
-        let ranges = std::mem::take(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()));
-        if ranges.is_empty() {
+        let mut remaps = std::mem::replace(&mut *REMAPPED.lock().unwrap_or_else(|e| e.into_inner()), Remaps::new());
+        if remaps.recent.is_empty() && remaps.older.is_empty() && !remaps.all_placed {
             return 0;
         }
-        let mut slots: Vec<u32> = {
+        if retain_remaps() { coalesce_remaps(&mut remaps.recent); }
+        let (mut slots, mut previous) = {
             let placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
-            ranges.iter().flat_map(|&(start, end)| placed.slots_in(start, end)).collect()
+            let mut slots = Vec::new();
+            for &(start,end) in &remaps.recent { placed.append_slots(start, end, &mut slots); }
+            let mut previous = Vec::new();
+            if remaps.all_placed {
+                previous.extend(placed.by_slot.keys().copied());
+            } else {
+                for &(start,end) in &remaps.older { placed.append_slots(start, end, &mut previous); }
+            }
+            (slots, previous)
         };
         slots.sort_unstable();
         slots.dedup();
         slots.retain(|&slot| !self.tabled_lately(slot, frame));
+        previous.sort_unstable();
+        previous.dedup();
+        previous.retain(|&slot| slots.binary_search(&slot).is_err() && !self.tabled_lately(slot, frame));
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        if !remaps.older.is_empty() || remaps.all_placed {
+            let previously_current = previous.iter().filter(|s| !textures.slots.contains_key(s)).count();
+            tracing::info!(frame, recent_intervals=remaps.recent.len(), older_intervals=remaps.older.len(),
+                all_placed=remaps.all_placed, overflow_only_slots=previous.len(), previously_current,
+                "retained texture memory invalidations");
+        }
+        // Keep ascending slot order and the original queue's write numbering.
+        if !previous.is_empty() {
+            slots.extend_from_slice(&previous);
+            slots.sort_unstable();
+        }
         for &slot in &slots {
-            textures.changed(slot, frame, frame + 1);
+            let overflow = if previous.binary_search(&slot).is_ok() { if remaps.all_placed { 2 } else { 1 } } else { 0 };
+            textures.changed(slot, frame, frame + 1, overflow);
         }
         STALE[3].fetch_add(slots.len() as u64, Relaxed);
         slots.len()
@@ -2416,6 +2512,64 @@ mod tests {
         // A wider texture written at the same address: slot 1 is stale.
         assert_eq!(heap.note_buffer(2, Some(&view(at, 128)), false), [1]);
         assert_eq!(slots(u64::MAX), [2]);
+    }
+
+    #[test]
+    fn retained_texture_remaps_keep_exact_intervals_and_bound_fragmented_overflow() {
+        let mut journal = Remaps::new();
+        for i in 0..MAX_REMAPS {
+            let start = 0x1000 + ((i & 1) as u64) * 0x200;
+            journal.push(start, start + 0x80, true);
+        }
+        assert_eq!(journal.push(0x9000, 0x9080, true), MAX_REMAPS);
+        assert_eq!(journal.older, [(0x1000, 0x1080), (0x1200, 0x1280)]);
+        assert_eq!(journal.recent, [(0x9000, 0x9080)]);
+        assert!(!journal.all_placed);
+        let mut fragmented = Remaps::new();
+        for i in 0..2*MAX_REMAPS + 1 {
+            let start = i as u64 * 16;
+            fragmented.push(start, start + 4, true);
+            assert!(fragmented.older.len() <= MAX_REMAPS && fragmented.recent.len() <= MAX_REMAPS);
+        }
+        assert!(fragmented.all_placed);
+        assert!(fragmented.older.is_empty());
+    }
+
+    /// A real host descriptor heap: the original cap loses a completed slot's
+    /// only invalidation. The corrected queue makes it due once and rejects
+    /// an in-flight completion with the old generation number.
+    #[test]
+    #[ignore = "run in separate processes with explicit adapter and 0/1 retention"]
+    fn native_texture_remap_overflow_restores_current_slot() {
+        let heap = HostHeap::new(false, 8).expect("native descriptor heap");
+        let at = 0x7fee_4000_0000u64;
+        let view = |address: u64| {
+            let mut desc = [0u32; 16];
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            View::Placed(false, [3,0,0,0,64,0,64,0x1_0001,98,1,0,0x105,0,0], desc)
+        };
+        let offsets = [0, 0x40000, 0x80000, 0xc0000];
+        for (i, off) in offsets.iter().enumerate() {
+            assert!(heap.note_buffer(i as u32 + 1, Some(&view(at + off)), false).is_empty());
+        }
+        let initial = heap.texture_slots_due(u64::MAX, 8).0;
+        for &(slot, version) in &initial { heap.texture_slot_done(slot, version, None); }
+        heap.tabled_in(2, true, 99);
+        // Early events hit slot 1 and the excluded table-read slot 2; slot 3
+        // lies outside every original interval. The post-overflow tail hits 4.
+        for i in 0..MAX_REMAPS {
+            remapped((at + offsets[i % 2]) as usize, 0x1000);
+        }
+        remapped((at + offsets[3]) as usize, 0x1000);
+        let restored = retain_remaps();
+        assert_eq!(heap.texture_slots_remapped(100), if restored { 2 } else { 1 });
+        assert!(heap.texture_slots_due(100,8).0.is_empty());
+        for &(slot, old) in &initial { heap.texture_slot_done(slot,old,None); }
+        let mut due: Vec<_> = heap.texture_slots_due(101,8).0.into_iter().map(|v|v.0).collect();
+        due.sort_unstable();
+        assert_eq!(due, if restored { vec![1,4] } else { vec![4] });
+        assert_eq!(heap.texture_slots_remapped(101), 0);
+        println!("retention={restored} original 32768 overflow entries, next-frame due {due:?}, table slot 2 and untouched slot 3 excluded");
     }
 
     /// A slot a draw read through a table leaves the queue; the title's
