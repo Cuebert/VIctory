@@ -544,6 +544,19 @@ fn create() -> windows::core::Result<Host> {
             let adapter = warp_adapter()?;
             D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
             tracing::info!("host device on the software adapter (WARP)");
+        } else if let Some(value) = std::env::var_os("VICTORY_D3D12_ADAPTER")
+            .filter(|_| cfg!(feature = "diagnostics"))
+        {
+            let invalid = |message| windows::core::Error::new(windows::Win32::Foundation::E_INVALIDARG, message);
+            let index = value.to_str().and_then(|s| s.parse::<u32>().ok())
+                .ok_or_else(|| invalid("Expected a numeric DXGI adapter index"))?;
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))?;
+            let adapter = factory.EnumAdapters1(index)?;
+            if adapter.GetDesc1()?.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+                return Err(invalid("The requested hardware adapter is software-rendered"));
+            }
+            D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_12_0, &mut device)?;
+            tracing::info!(index, "created D3D12 device on requested DXGI adapter");
         } else {
             D3D12CreateDevice(None, D3D_FEATURE_LEVEL_12_0, &mut device)?;
         }
@@ -2726,7 +2739,24 @@ fn hand_back(back: &[Declared]) {
     }
 }
 
+fn synchronous_receipt_proven(wait: u32, completed: u64, target: u64, device_healthy: bool) -> bool {
+    wait == 0 && completed != u64::MAX && completed >= target && device_healthy
+}
+
 impl Host {
+    /// The signal and event registration succeeded. Validate the wait and the
+    /// fence itself before observing GPU output or reusing submitted objects.
+    fn require_synchronous_receipt(&self, target: u64, wait: u32) {
+        // SAFETY: both are status queries on the live submission objects.
+        let completed = unsafe { self.fence.GetCompletedValue() };
+        let device_healthy = unsafe { self.device.GetDeviceRemovedReason() }.is_ok();
+        if !synchronous_receipt_proven(wait, completed, target, device_healthy) {
+            fail(format_args!(
+                "unproven synchronous GPU completion (target={target}, completed={completed}, wait={wait:#x})"
+            ));
+        }
+    }
+
     /// Whether the host runs mesh shaders at shader model 6.6 (translated
     /// mesh shaders need both); logged once.
     pub(crate) fn mesh_shaders(&self) -> bool {
@@ -3536,7 +3566,8 @@ impl Host {
                     self.queue.Signal(&self.fence, *submitted)?;
                     self.fence.SetEventOnCompletion(*submitted, self.event)?;
                     let was_working = working(false);
-                    WaitForSingleObject(self.event, INFINITE);
+                    let wait = WaitForSingleObject(self.event, INFINITE);
+                    self.require_synchronous_receipt(*submitted, wait.0);
                     stood(waiting);
                     working(was_working);
                     Ok(())
@@ -4033,11 +4064,12 @@ impl Host {
                 match waited {
                     Ok(()) => {
                         working(false);
-                        WaitForSingleObject(self.event, INFINITE);
+                        let wait = WaitForSingleObject(self.event, INFINITE);
+                        self.require_synchronous_receipt(*submitted, wait.0);
                         stood(started);
                         working(true);
                     }
-                    Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
+                    Err(e) => fail(format_args!("could not register the synchronous GPU receipt ({e})")),
                 }
             }
             // With timing on each group is one of `runs` (and the compare

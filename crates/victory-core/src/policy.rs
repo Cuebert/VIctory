@@ -7,6 +7,17 @@
 //! rule is `cargo xtask policy`, which checks what git tracks.
 
 use std::path::{Component, Path, PathBuf};
+#[cfg(windows)]
+mod windows_path;
+
+fn canonical_existing(path: &Path) -> std::io::Result<PathBuf> {
+    let result = std::fs::canonicalize(path);
+    #[cfg(windows)]
+    if matches!(&result, Err(e) if e.raw_os_error() == Some(5)) {
+        return windows_path::canonical_local(path);
+    }
+    result
+}
 
 /// Marker file at the root of the source tree.
 pub const ROOT_MARKER: &str = ".victory-root";
@@ -41,7 +52,7 @@ pub enum PolicyError {
 pub fn ensure_outside_repo(path: &Path) -> Result<(), PolicyError> {
     let resolved = resolve(path)?;
 
-    if let Ok(root) = std::fs::canonicalize(compiled_workspace_root())
+    if let Ok(root) = canonical_existing(&compiled_workspace_root())
         && root.join(ROOT_MARKER).is_file()
         && resolved.starts_with(&root)
     {
@@ -79,7 +90,7 @@ fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
     let mut existing = absolute.as_path();
     let mut rest = Vec::new();
     loop {
-        match std::fs::canonicalize(existing) {
+        match canonical_existing(existing) {
             Ok(canon) => {
                 let mut out = canon;
                 for component in rest.iter().rev() {
@@ -87,18 +98,26 @@ fn resolve(path: &Path) -> Result<PathBuf, PolicyError> {
                 }
                 return Ok(normalize(&out));
             }
-            Err(source) => match (existing.parent(), existing.file_name()) {
-                (Some(parent), Some(name)) => {
-                    rest.push(name.to_os_string());
-                    existing = parent;
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                match (existing.parent(), existing.file_name()) {
+                    (Some(parent), Some(name)) => {
+                        rest.push(name.to_os_string());
+                        existing = parent;
+                    }
+                    _ => {
+                        return Err(PolicyError::Io {
+                            path: path.to_path_buf(),
+                            source,
+                        });
+                    }
                 }
-                _ => {
-                    return Err(PolicyError::Io {
-                        path: path.to_path_buf(),
-                        source,
-                    });
-                }
-            },
+            }
+            Err(source) => {
+                return Err(PolicyError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                });
+            }
         }
     }
 }

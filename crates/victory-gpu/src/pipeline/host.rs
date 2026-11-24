@@ -360,7 +360,10 @@ impl HostPipeline {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
         for (s, _) in &stages {
-            s.translated()?;
+            let t = s.translated()?;
+            if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
+                return refuse("raw guest-address shaders are disabled in this comparison", shaders);
+            }
         }
         let host = host()?;
 
