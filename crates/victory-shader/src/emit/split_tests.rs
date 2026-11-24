@@ -69,6 +69,14 @@ const IN_HALF: &[u32] = &[
 fn run(host: &Host, native: &crate::NativeProgram, groups: u32) -> Result<Vec<u32>, String> {
     let target = host.target();
     let cs = emit_for(native, target).map_err(|e| e.to_string())?;
+    // The validator, where one is installed: drivers take some modules it
+    // refuses.
+    if let Ok(mut v) =
+        super::validator::Validator::load(super::validator::Validator::default_path().as_deref())
+    {
+        v.validate(&mut cs.dxil.clone())
+            .map_err(|e| format!("validation: {e}"))?;
+    }
     let (root, pso) = host.compute_pipeline(&cs)?;
     let data = vec![0; (cs.user_data_dwords() as usize).max(1)];
     let StageIo::Cs(io) = &native.io else {
@@ -202,6 +210,15 @@ fn console_flow_case(label: &str, body: &[u32], threads: u32, want: impl Fn(u32)
 /// [`console_flow_case`], checking hosts with 64-lane waves (the per-lane
 /// form) only when `native` says.
 fn flow_case(label: &str, body: &[u32], threads: u32, want: impl Fn(u32) -> u32, native: bool) {
+    program_case(label, &program(body, threads), want, native);
+}
+
+/// [`flow_case`] of a program built by the caller.
+fn program_case(label: &str, p: &crate::NativeProgram, want: impl Fn(u32) -> u32, native: bool) {
+    let StageIo::Cs(io) = &p.io else {
+        unreachable!()
+    };
+    let threads = io.threads[0];
     let Ok(names) = adapters() else {
         eprintln!("no DXGI; skipped");
         return;
@@ -210,10 +227,9 @@ fn flow_case(label: &str, body: &[u32], threads: u32, want: impl Fn(u32) -> u32,
         let Ok(host) = Host::on(&name) else {
             continue;
         };
-        let p = program(body, threads);
         let split = !host.target().runs(64);
         let groups = 2;
-        let out = run(&host, &p, groups).unwrap_or_else(|e| panic!("{name}: {label}: {e}"));
+        let out = run(&host, p, groups).unwrap_or_else(|e| panic!("{name}: {label}: {e}"));
         let expect: Vec<u32> = (0..groups).flat_map(|_| (0..threads).map(&want)).collect();
         if !split && !native {
             if out != expect {
@@ -298,10 +314,8 @@ fn console_flow_is_for_one_console_wave_per_group() {
 /// the upper half's go on to 63, and the console wave loops while any lane
 /// does. After it, s9 holds lane 40's id, as the last iteration read it.
 ///
-/// The per-lane form (hosts with 64-lane waves) gets this wrong: a lane
-/// that left the loop is not there for the later iterations' lane reads,
-/// and a lane that skipped the loop never sees the scalar it set (on an
-/// RDNA2 iGPU, lane 0 ends with 0 and lanes 41 to 63 with t).
+/// The per-lane form got this wrong on every host (#225); hosts with
+/// 64-lane waves now run it in the console flow too, without exchanges.
 #[test]
 fn loops_run_while_any_lane_of_the_console_wave_does() {
     let body = [
@@ -321,7 +335,7 @@ fn loops_run_while_any_lane_of_the_console_wave_does() {
         0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
         0x4A04_0409, // v_add_nc_u32 v2, s9, v2
     ];
-    flow_case("loop t times reading lane 40", &body, 64, |t| t + 40, false);
+    console_flow_case("loop t times reading lane 40", &body, 64, |t| t + 40);
 }
 
 /// DPP's row mask names the console's rows: with `row_mask:0x3` only
@@ -354,4 +368,294 @@ fn first_lane_reads_are_the_console_waves() {
         0x7E04_0209, // v_mov_b32 v2, s9
     ];
     console_flow_case("DPP and v_readfirstlane", &body, 64, |_| 0);
+}
+
+/// `v_writelane` ignores EXEC: inside a branch only lanes below 20 take,
+/// it still writes lane 40. The per-lane form never had lane 40 there.
+#[test]
+fn lane_writes_reach_lanes_outside_the_branch() {
+    let body = [
+        0x7E04_0281, // v_mov_b32 v2, 1
+        0x7D88_0094, // v_cmp_gt_u32 vcc, 20, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+        0xBF88_0004, // s_cbranch_execz +4
+        0xBE89_03FF,
+        0x0000_004D, // s_mov_b32 s9, 77
+        0xD761_0002,
+        0x0001_5009, // v_writelane_b32 v2, s9, 40
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+    ];
+    console_flow_case("if (lane < 20) writelane(40, 77)", &body, 64, |t| {
+        if t == 40 { 77 } else { 1 }
+    });
+}
+
+/// The loop form compilers emit: lanes that are done are added to an exit
+/// mask that starts as 0, EXEC loses them, and the mask restores EXEC
+/// after the loop. Lane t runs t + 1 iterations with a read of lane 40 in
+/// each; afterwards every lane has s9 = 40 and counts all 64 lanes in the
+/// exit mask.
+#[test]
+fn loops_with_an_exit_mask_grown_from_zero() {
+    let body = [
+        0x4A02_0081, // v_add_nc_u32 v1, 1, v0
+        0xBE8A_0480, // s_mov_b64 s[10:11], 0
+        0xBE89_0380, // s_mov_b32 s9, 0
+        // loop:
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x4E02_0281, // v_subrev_nc_u32 v1, 1, v1
+        0x7D84_0280, // v_cmp_eq_u32 vcc, 0, v1
+        0x888A_0A6A, // s_or_b64 s[10:11], vcc, s[10:11]
+        0x8AFE_0A7E, // s_andn2_b64 exec, exec, s[10:11]
+        0xBF89_FFF9, // s_cbranch_execnz loop
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0xBE8C_100A, // s_bcnt1_i32_b64 s12, s[10:11]
+        0x7E04_0209, // v_mov_b32 v2, s9
+        0x4A04_040C, // v_add_nc_u32 v2, s12, v2
+    ];
+    console_flow_case("exit-mask loop reading lane 40", &body, 64, |_| 40 + 64);
+}
+
+/// [`program`] with 512 bytes of LDS.
+fn program_lds(body: &[u32], threads: u32) -> crate::NativeProgram {
+    let mut p = program(body, threads);
+    let StageIo::Cs(io) = &mut p.io else {
+        unreachable!()
+    };
+    io.rsrc2 |= 1 << 15;
+    p
+}
+
+/// One console wave sharing LDS without `s_barrier`: the console runs each
+/// instruction in all 64 lanes before the next, so a lane reads what a lane
+/// of the other half wrote one instruction earlier. Lane t writes t to
+/// dword t, then reads dword 63 - t; then writes that plus 50 to dword t
+/// and reads dword t ^ 32.
+#[test]
+fn one_wave_shares_lds_in_instruction_order() {
+    let body = [
+        0x4C0A_00BF, // v_sub_nc_u32 v5, 63, v0
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0x340C_0A82, // v_lshlrev_b32 v6, 2, v5
+        0xD834_0000,
+        0x0000_0004, // ds_write_b32 v4, v0
+        0xD8D8_0000,
+        0x0700_0006, // ds_read_b32 v7, v6
+        0x4A0E_0EB2, // v_add_nc_u32 v7, 50, v7
+        0xD834_0000,
+        0x0000_0704, // ds_write_b32 v4, v7
+        0x3A10_00A0, // v_xor_b32 v8, 32, v0
+        0x3410_1082, // v_lshlrev_b32 v8, 2, v8
+        0xD8D8_0000,
+        0x0200_0008, // ds_read_b32 v2, v8
+    ];
+    // Dword u holds (63 - u) + 50 after the second write.
+    program_case(
+        "LDS in instruction order",
+        &program_lds(&body, 64),
+        |t| (63 - (t ^ 32)) + 50,
+        true,
+    );
+}
+
+/// The same sharing with the halves pulled apart: only the lower half does
+/// 48 buffer stores before its LDS write, so without a barrier the upper
+/// half's read of the lower half's dword can come first. Lane t writes t to
+/// dword t and reads dword 63 - t.
+///
+/// On an RTX 5070 both LDS tests also pass with the barrier before each LDS
+/// access left out: that card keeps the two waves in step for these
+/// programs. They check that the form gives the console's result, not that
+/// the barrier is what gives it; D3D12 promises no order between a group's
+/// waves without one.
+#[test]
+fn lds_order_holds_when_one_half_is_busy() {
+    let mut body = vec![
+        0x3412_0082, // v_lshlrev_b32 v9, 2, v0
+        0x4A12_1208, // v_add_nc_u32 v9, s8, v9
+        0x7D88_00A0, // v_cmp_gt_u32 vcc, 32, v0
+        0xBE8A_246A, // s_and_saveexec_b64 s[10:11], vcc
+    ];
+    for _ in 0..48 {
+        // buffer_store_dword v0, v9, s[4:7], 0 offen
+        body.extend_from_slice(&[0xE070_1000, 0x8001_0009]);
+    }
+    body.extend_from_slice(&[
+        0x88FE_0A7E, // s_or_b64 exec, exec, s[10:11]
+        0x4C0A_00BF, // v_sub_nc_u32 v5, 63, v0
+        0x3408_0082, // v_lshlrev_b32 v4, 2, v0
+        0x340C_0A82, // v_lshlrev_b32 v6, 2, v5
+        0xD834_0000,
+        0x0000_0004, // ds_write_b32 v4, v0
+        0xD8D8_0000,
+        0x0200_0006, // ds_read_b32 v2, v6
+    ]);
+    program_case(
+        "LDS order with a busy lower half",
+        &program_lds(&body, 64),
+        |t| 63 - t,
+        true,
+    );
+}
+
+/// The diagnostic summary of the module emitted last: what it declares and
+/// the operations it calls, nothing of the console program.
+#[test]
+fn the_last_modules_summary_names_its_group_wave_size_and_operations() {
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let body = [
+        0xD760_0009,
+        0x0001_5100, // v_readlane_b32 s9, v0, 40
+        0x7E04_0209, // v_mov_b32 v2, s9
+    ];
+    let mut p = program(&body, 64);
+    let StageIo::Cs(io) = &mut p.io else {
+        unreachable!()
+    };
+    io.threads = [8, 8, 1];
+    emit_for(&p, nvidia).unwrap();
+    let summary = super::last_module_summary();
+    eprintln!("{summary}");
+    assert!(
+        summary.starts_with("threads 8x8x1, wave size 32; ops: "),
+        "{summary}"
+    );
+    for op in ["barrier", "waveReadLaneAt", "flattenedThreadIdInGroup"] {
+        assert!(summary.contains(op), "{op} in {summary}");
+    }
+}
+
+/// Sum lane IDs within rows, add the preceding row, then carry lane 31's
+/// inclusive result into the upper half. Lane 32 must start at 528.
+#[test]
+fn wave64_inclusive_prefix_joins_both_host_waves() {
+    let body = [
+        0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
+        0xD501_0001,
+        0x0002_0080, // v_cndmask_b32 v1, 0, v0, s[0:1]
+        0x4A02_02FA,
+        0xFF01_1101, // v_add_nc_u32 v1, v1, v1 row_shr:1
+        0x4A02_02FA,
+        0xFF01_1201, // row_shr:2
+        0x4A02_02FA,
+        0xFF01_1401, // row_shr:4
+        0x4A02_02FA,
+        0xFF01_1801, // row_shr:8
+        0xD778_0002,
+        0x0305_8301, // v_permlanex16_b32 v2, v1, -1, -1
+        0x7E06_0280, // v_mov_b32 v3, 0
+        0x7E06_02FA,
+        0xAF00_E402, // v_mov_b32 v3, v2, row_mask:0xa
+        0x4A02_0701, // v_add_nc_u32 v1, v1, v3
+        0xD760_0009,
+        0x0001_3F01, // v_readlane_b32 s9, v1, 31
+        0xBEFE_0380, // s_mov_b32 exec_lo, 0
+        0xBEFF_03C1, // s_mov_b32 exec_hi, -1
+        0x4A02_0209, // v_add_nc_u32 v1, s9, v1
+        0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+        0x7E04_0301, // v_mov_b32 v2, v1
+    ];
+    console_flow_case("whole-wave inclusive sum", &body, 64, |n| n * (n + 1) / 2);
+}
+
+/// A scan of the lane ids with `opcode` (a VOP2 operation) as its step and
+/// `ident` (an inline constant operand) in the lanes outside the mask, as
+/// in the test above, then a read of lane 63: the reduction over the whole
+/// console wave, left in s10. It uses v1 to v3 as scratch in every lane.
+fn reduction_scan(opcode: u32, ident: u32) -> Vec<u32> {
+    let op = opcode << 25;
+    vec![
+        0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
+        0xD501_0001,
+        0x0002_0000 | ident, // v_cndmask_b32 v1, ident, v0, s[0:1]
+        op | 0x0002_02FA,
+        0xFF01_1101, // v_<op> v1, v1, v1 row_shr:1
+        op | 0x0002_02FA,
+        0xFF01_1201, // row_shr:2
+        op | 0x0002_02FA,
+        0xFF01_1401, // row_shr:4
+        op | 0x0002_02FA,
+        0xFF01_1801, // row_shr:8
+        0xD778_0002,
+        0x0305_8301,         // v_permlanex16_b32 v2, v1, -1, -1
+        0x7E06_0200 | ident, // v_mov_b32 v3, ident
+        0x7E06_02FA,
+        0xAF00_E402,      // v_mov_b32 v3, v2 row_mask:0xa
+        op | 0x0002_0701, // v_<op> v1, v1, v3
+        0xD760_0009,
+        0x0001_3F01,      // v_readlane_b32 s9, v1, 31
+        0xBEFE_0380,      // s_mov_b32 exec_lo, 0
+        0xBEFF_03C1,      // s_mov_b32 exec_hi, -1
+        op | 0x0002_0209, // v_<op> v1, s9, v1
+        0xD760_000A,
+        0x0001_7F01, // v_readlane_b32 s10, v1, 63
+        0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+    ]
+}
+
+/// Reductions over the whole console wave need both halves: the sum of the
+/// lane ids, their maximum (lane 63, in the upper half), their minimum
+/// (lane 0, in the lower half) and their bitwise or.
+#[test]
+fn whole_wave_reductions_join_both_host_waves() {
+    // (operation, VOP2 opcode, identity operand, the console's result)
+    for (label, opcode, ident, want) in [
+        ("v_add_nc_u32", 37, 0x80, 2016),
+        ("v_max_u32", 20, 0x80, 63),
+        ("v_min_u32", 19, 0xC1, 0),
+        ("v_or_b32", 28, 0x80, 63),
+    ] {
+        let mut body = reduction_scan(opcode, ident);
+        body.push(0x7E04_020A); // v_mov_b32 v2, s10
+        console_flow_case(&format!("whole-wave {label}"), &body, 64, |_| want);
+    }
+}
+
+/// The same sum over a mask that straddles the halves: lanes below 40 (32
+/// in the lower half, 8 in the upper). The other lanes keep their value.
+#[test]
+fn masked_whole_wave_sum_straddles_the_halves() {
+    // The result goes through v5: the scan leaves no old value in v2.
+    let mut body = vec![
+        0x7E0A_0281, // v_mov_b32 v5, 1
+        0x7D88_00A8, // v_cmp_gt_u32 vcc, 40, v0
+        0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+    ];
+    body.extend(reduction_scan(37, 0x80));
+    body.extend([
+        0x7E0A_020A, // v_mov_b32 v5, s10
+        0x88FE_0C7E, // s_or_b64 exec, exec, s[12:13]
+        0x7E04_0305, // v_mov_b32 v2, v5
+    ]);
+    // 0 + 1 + ... + 39 = 780.
+    console_flow_case("masked whole-wave sum", &body, 64, |t| {
+        if t < 40 { 780 } else { 1 }
+    });
+}
+
+/// A whole-wave section crosses the halves only in a group of exactly one
+/// console wave: with a partial upper half, or none, it still stops.
+#[test]
+fn whole_wave_sections_in_partial_groups_still_stop() {
+    let nvidia = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let mut body = reduction_scan(37, 0x80);
+    body.push(0x7E04_020A); // v_mov_b32 v2, s10
+    assert!(emit_for(&program(&body, 64), nvidia).is_ok());
+    for threads in [48, 32] {
+        assert_eq!(
+            emit_for(&program(&body, threads), nvidia),
+            Err(crate::ShaderError::Unsupported {
+                offset: 0,
+                what: "a whole-wave section of a wave64 on a host without 64-lane waves",
+            }),
+            "{threads} threads"
+        );
+    }
 }

@@ -84,12 +84,14 @@ mod diff_tests;
 mod image_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+#[cfg(all(test, windows))]
+mod lane_read_loop_tests;
 mod lower;
 mod sampler;
 mod shader;
-mod threading;
 #[cfg(all(test, windows))]
 mod split_tests;
+mod threading;
 #[cfg(windows)]
 pub mod validator;
 #[cfg(all(test, windows))]
@@ -228,6 +230,13 @@ impl Default for Target {
     }
 }
 
+/// A diagnostic: what the module this thread emitted last declares and
+/// calls (thread-group size, wave size, `dx.op` operations), for reports of
+/// a module the validator refuses. Nothing of the console program is in it.
+pub fn last_module_summary() -> String {
+    shader::last_summary()
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container, for any host ([`Target::ANY`]).
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
@@ -286,6 +295,38 @@ pub fn emit(
     let res = resource::track(&p, &native.layout, native.stage)?;
     emit_program(c, native, &p, &st, &io, &res, target)
 }
+
+/// Tests: the first lowering of a compute program alone, without the
+/// console flow it may stop to ask for ([`lower::CONSOLE_FLOW`]), or the
+/// per-lane form only.
+#[cfg(test)]
+pub(crate) fn lower_compute(
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    per_lane_only: bool,
+) -> Result<(), ShaderError> {
+    lower::lower(&lower::Parts {
+        native,
+        p,
+        st,
+        io,
+        res,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        target: Target::ANY,
+        console_cf: false,
+        per_lane_only,
+    })
+    .map(|_| ())
+}
+
+#[cfg(test)]
+pub(crate) use lower::CONSOLE_FLOW;
 
 fn emit_program(
     c: &Container,
@@ -367,13 +408,36 @@ fn emit_program(
         mesh_stride,
         target,
         console_cf: false,
+        per_lane_only: false,
     };
     let l = match lower::lower(&parts) {
         Err(ShaderError::Unsupported { what, .. }) if what == lower::CONSOLE_FLOW => {
-            let console = structure::structure_console(p)?;
-            parts.st = &console;
-            parts.console_cf = true;
-            lower::lower(&parts)?
+            let console = structure::structure_console(p);
+            let lowered = match &console {
+                Ok(console) => {
+                    parts.st = console;
+                    parts.console_cf = true;
+                    lower::lower(&parts)
+                }
+                Err(e) => Err(ShaderError::Unsupported {
+                    offset: 0,
+                    what: match e {
+                        ShaderError::Unsupported { what, .. } => what,
+                        _ => "a program the console structure cannot hold",
+                    },
+                }),
+            };
+            match lowered {
+                Ok(l) => l,
+                // What the console flow cannot lower keeps the per-lane form
+                // where that translates; else the console flow's reason.
+                Err(e) => {
+                    parts.st = st;
+                    parts.console_cf = false;
+                    parts.per_lane_only = true;
+                    lower::lower(&parts).map_err(|_| e)?
+                }
+            }
         }
         l => l?,
     };
@@ -820,7 +884,7 @@ mod tests {
             emit_for(&two, NVIDIA),
             Err(crate::ShaderError::Unsupported {
                 offset: 0,
-                what: "console wave64 lanes on a host without 64-lane waves",
+                what: "console wave64 lanes in a group of more than 64 threads on a host without 64-lane waves",
             })
         );
         // The same code in waves of 32 runs on either.
@@ -1135,36 +1199,9 @@ mod tests {
         validate_if_available(&vs.dxil);
     }
 
-    #[test]
-    fn compute_shader_implicit_sample_uses_valver_1_8_and_validates() {
-        // Synthetic CS (8x8x1): loads a 2D texture SRV from a root table (s0)
-        // and samples it with an immediate sampler (s[8:11]) via `image_sample`.
-        // s_load_dwordx8 s[0:7], s[12:13], 0x0 (table in s12)
-        // Wait: in resource::track, a 1-SGPR table pointer uses s_load_dwordx8
-        // from s[0:1] when layout has RootType::Table at user_data=0!
-        // Encode:
-        //   s_mov_b32 s1, 0             (high half of 64-bit table base)
-        //   s_load_dwordx8 s[4:11], s[0:1], 0x0
-        //   s_mov_b32 s12, 0; s_mov_b32 s13, 0; s_mov_b32 s14, 0; s_mov_b32 s15, 0
-        //   v_mov_b32 v0, 0.5; v_mov_b32 v1, 0.5
-        //   image_sample v0, v[0:1], s[4:11], s[12:15] dmask:0x1 dim:SQ_RSRC_IMG_2D
-        //   s_endpgm
-        let words = [
-            0xBE81_0380u32, // s_mov_b32 s1, 0
-            0xF40C_0100,    // s_load_dwordx8 s[4:11], s[0:1], 0
-            0xFA00_0000,    // soffset=NULL, offset=0
-            0xBE8C_0380,    // s_mov_b32 s12, 0
-            0xBE8D_0380,    // s_mov_b32 s13, 0
-            0xBE8E_0380,    // s_mov_b32 s14, 0
-            0xBE8F_0380,    // s_mov_b32 s15, 0
-            0x7E00_02F0,    // v_mov_b32 v0, 0.5
-            0x7E02_02F0,    // v_mov_b32 v1, 0.5
-            // MIMG image_sample (op=0x20): w0 = 0xF000_0000 | (0x20 << 18) | (1 << 8) | (1 << 3)
-            0xF080_0108,
-            // w1: vaddr=v0, vdata=v0, srsrc=s[4:11] (1), ssamp=s[12:15] (3)
-            (3 << 21) | (1 << 16),
-            0xBF81_0000, // s_endpgm
-        ];
+    /// A compute program (8x8x1) of `words` sampling a 2D texture from a
+    /// root table, translated.
+    fn compute_sample(words: &[u32]) -> HostShader {
         let native = NativeProgram {
             stage: HwStage::Cs,
             wave64: false,
@@ -1193,11 +1230,86 @@ mod tests {
             }),
             code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
         };
-        let cs = emit_synthetic(&[], &native).unwrap();
-        // PSV0 must use RuntimeInfo3 (52 bytes) for validator 1.8.
+        emit_synthetic(&[], &native).unwrap()
+    }
+
+    /// The PSV0 runtime info size, 48 bytes up to validator 1.7, 52 (info
+    /// version 3) for validator 1.8.
+    fn psv0_size(cs: &HostShader) -> u32 {
         let parsed = Container::parse(&cs.dxil).unwrap();
         let psv0 = parsed.part(FourCC::PSV0).unwrap().data;
-        assert_eq!(crate::dxbc::u32_at(psv0, 0).unwrap(), 52);
+        crate::dxbc::u32_at(psv0, 0).unwrap()
+    }
+
+    #[test]
+    fn compute_shader_implicit_sample_takes_quad_gradients_and_validates() {
+        // Synthetic CS (8x8x1): loads a 2D texture SRV from a root table (s0)
+        // and samples it with an immediate sampler (s[8:11]) via `image_sample`.
+        // s_load_dwordx8 s[0:7], s[12:13], 0x0 (table in s12)
+        // Wait: in resource::track, a 1-SGPR table pointer uses s_load_dwordx8
+        // from s[0:1] when layout has RootType::Table at user_data=0!
+        // Encode:
+        //   s_mov_b32 s1, 0             (high half of 64-bit table base)
+        //   s_load_dwordx8 s[4:11], s[0:1], 0x0
+        //   s_mov_b32 s12, 0; s_mov_b32 s13, 0; s_mov_b32 s14, 0; s_mov_b32 s15, 0
+        //   v_mov_b32 v0, 0.5; v_mov_b32 v1, 0.5
+        //   image_sample v0, v[0:1], s[4:11], s[12:15] dmask:0x1 dim:SQ_RSRC_IMG_2D
+        //   s_endpgm
+        let words = [
+            0xBE81_0380u32, // s_mov_b32 s1, 0
+            0xF40C_0100,    // s_load_dwordx8 s[4:11], s[0:1], 0
+            0xFA00_0000,    // soffset=NULL, offset=0
+            0xBE8C_0380,    // s_mov_b32 s12, 0
+            0xBE8D_0380,    // s_mov_b32 s13, 0
+            0xBE8E_0380,    // s_mov_b32 s14, 0
+            0xBE8F_0380,    // s_mov_b32 s15, 0
+            0x7E00_02F0,    // v_mov_b32 v0, 0.5
+            0x7E02_02F0,    // v_mov_b32 v1, 0.5
+            // MIMG image_sample (op=0x20): w0 = 0xF000_0000 | (0x20 << 18) | (1 << 8) | (1 << 3)
+            0xF080_0108,
+            // w1: vaddr=v0, vdata=v0, srsrc=s[4:11] (1), ssamp=s[12:15] (3)
+            (3 << 21) | (1 << 16),
+            0xBF81_0000, // s_endpgm
+        ];
+        // The console quad's differences as gradients: no implicit
+        // derivatives, so no validator 1.8 (PSV0 RuntimeInfo2, 48 bytes).
+        let cs = compute_sample(&words);
+        assert_eq!(psv0_size(&cs), 48);
+        #[cfg(windows)]
+        {
+            validate_if_available(&cs.dxil);
+            if let Ok(host) = super::host::Host::new(false) {
+                host.compute_pipeline(&cs).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn compute_shader_implicit_comparison_sample_uses_valver_1_8_and_validates() {
+        // As above with `image_sample_c` (reference in v0, coordinates in
+        // v[1:2]): SM 6.6 has no comparison sample with gradients, so the
+        // host's implicit derivatives, which DXIL takes in compute from
+        // validator 1.8 on.
+        let words = [
+            0xBE81_0380u32, // s_mov_b32 s1, 0
+            0xF40C_0100,    // s_load_dwordx8 s[4:11], s[0:1], 0
+            0xFA00_0000,    // soffset=NULL, offset=0
+            0xBE8C_0380,    // s_mov_b32 s12, 0
+            0xBE8D_0380,    // s_mov_b32 s13, 0
+            0xBE8E_0380,    // s_mov_b32 s14, 0
+            0xBE8F_0380,    // s_mov_b32 s15, 0
+            0x7E00_02F0,    // v_mov_b32 v0, 0.5
+            0x7E02_02F0,    // v_mov_b32 v1, 0.5
+            0x7E04_02F0,    // v_mov_b32 v2, 0.5
+            // MIMG image_sample_c (op=0x28): w0 = 0xF000_0000 | (0x28 << 18) | (1 << 8) | (1 << 3)
+            0xF0A0_0108,
+            // w1: vaddr=v0, vdata=v0, srsrc=s[4:11] (1), ssamp=s[12:15] (3)
+            (3 << 21) | (1 << 16),
+            0xBF81_0000, // s_endpgm
+        ];
+        let cs = compute_sample(&words);
+        // PSV0 must use RuntimeInfo3 (52 bytes) for validator 1.8.
+        assert_eq!(psv0_size(&cs), 52);
         #[cfg(windows)]
         {
             validate_if_available(&cs.dxil);

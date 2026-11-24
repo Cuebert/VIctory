@@ -3,8 +3,11 @@
 Status: steps 1, 2, 4 and 5 are in. On NVIDIA, wave64 programs whose lanes
 read only their own half run as two 32-lane waves. Groups of one console
 wave also run in the console flow: masks read whole, lanes of the other
-half, divergent branches and loops. Still open: groups of several console
-waves, LDS, whole-wave sections and `ds_(b)permute`.
+half, divergent branches and loops, LDS shared in the console's
+instruction order, and (in groups of exactly 64 threads) whole-wave integer
+reductions and prefix sums. Still open: groups of several console waves,
+whole-wave sections in other groups or of floats, and `ds_(b)permute`; each
+stops with its own reason.
 
 ## The problem
 
@@ -116,24 +119,58 @@ does (step 5, `lower::CONSOLE_FLOW`):
 `lower` tries the per-lane form first. A program that needs the console
 flow stops with `CONSOLE_FLOW`, and `emit` lowers it again from the
 console structure. Eligible: wave64 compute on a host without 64-lane
-waves, at most 64 threads per group, no LDS, no `ds_(b)permute`, and no
-whole-wave sections.
+waves, at most 64 threads per group, no `ds_(b)permute`, and whole-wave
+sections only in a group of exactly 64 threads.
+
+**LDS.** The console runs an instruction in all 64 lanes before the next,
+so one wave shares LDS without `s_barrier`: a lane reads what a lane of the
+other half wrote one instruction earlier. In the console flow both halves
+reach every LDS access together, so a group barrier before each access puts
+it after every earlier one. This also takes the programs that needed 64-lane
+waves only for that (one console wave per group, LDS, no cross-lane read).
+Two testers' counts on the title put those first: 120 of the 223 programs
+#233 still stopped on a 32-lane host. On an RTX 5070 the LDS tests pass
+without the barrier too (that card keeps the two waves in step), so they
+check the result, not the need for the barrier.
+
+**Whole-wave sections** (contributed by Raxstreams). A section stays
+recognised as it is (`emit::wave`), and only what it leaves crosses the
+halves, where the section is lowered: each half's reduction is exchanged
+and the two are combined with the section's own operation (sum, and, or,
+xor, minimum, maximum of integers); a prefix sum in the upper half adds the
+lower half's total. Only in a group of exactly 64 threads, so both halves
+are whole. Float reductions stop: a float sum would change its order, and
+minimum and maximum, which would stay exact, are not done yet. A title run
+on #439 put these next: 24 of the 45 programs the stack still stopped.
+
+What still stops says why: `console wave64 lanes in a group of more than 64
+threads`, `ds_permute across the halves`, or `a whole-wave section` (in
+other groups), each `on a host without 64-lane waves`.
 
 Groups of several console waves still need another meeting point: a group
 barrier would wait for console waves elsewhere. The plan stays per-console-
 wave arrival counters with double-buffered slots and a bounded wait.
 
-### A finding about the per-lane form
+### The console flow on every host
 
-`split_tests::loops_run_while_any_lane_of_the_console_wave_does` (a loop
-lane t runs t times, reading lane 40 in each iteration) is exact in the
-console flow on an RTX 5070. On a Radeon iGPU, the per-lane form (which
-hosts with 64-lane waves get) is wrong: lane 0 ends with 0 instead of 40,
-and lanes 41 to 63 with t instead of t + 40. A lane that has left the
-loop is not there when later iterations read it, and a lane that skipped
-the loop never sees the scalar the loop set. On the console, `v_readlane`
-reads lane 40 whatever EXEC holds. So the console flow may be the better
-form for such programs on AMD too. Not changed there yet.
+The per-lane form is wrong for a program that reads or writes a named
+lane (`v_readlane`, `v_writelane`) where its lanes branch differently
+(#225). Those instructions ignore EXEC on the console and a wave runs a loop
+while any lane does. Per lane, a lane that left a loop or skipped a branch
+is not there to be read or written, and never sees scalars set inside.
+Measured before the change: a loop lane t runs t times, reading lane L in
+each iteration, had 12 of 32 lanes wrong (wave32, RTX 5070 and Radeon) and
+24 of 64 (wave64, Radeon); a `v_writelane` to lane 40 inside a branch only
+lanes below 20 take never wrote lane 40.
+
+Such compute programs now ask for the console flow on every host (the
+second case of `CONSOLE_FLOW`): a program with `v_readlane` or
+`v_writelane`, at least one branch that is not uniform, no `ds_(b)permute`
+and no whole-wave sections. On a host that runs the console's wave size,
+one host wave is the console wave, so ballots are the wave's own and nothing
+is exchanged; any group size and LDS are fine. If the console flow cannot
+lower the program, it keeps the per-lane form (`Parts::per_lane_only`), so
+nothing that translated before is refused.
 
 ## Testing
 
@@ -163,7 +200,8 @@ takes `WaveSize(64)`, the NVIDIA reports 32-32).
    whose waves already meet at barriers.
 5. ~~The console flow and the one-wave exchange (ballots, readlane,
    readfirstlane, writelane, mbcnt, divergent branches and loops).~~
-6. Multi-wave groups (counters), then one-wave LDS sharing.
+6. ~~One-wave LDS sharing (a group barrier before each LDS access in the
+   console flow).~~ Then multi-wave groups (counters).
 
 ## Credit
 

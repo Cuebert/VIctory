@@ -345,6 +345,31 @@ mod tests {
         crate::emit::emit(&c, &native, &p, &st, &io, &res, crate::emit::Target::ANY).map(|_| ())
     }
 
+    /// The same program's first lowering alone (no console flow), or its
+    /// per-lane form only.
+    fn lower_first(words: &[u32], fwd: bool, per_lane_only: bool) -> Result<(), ShaderError> {
+        let native = NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 8,
+            layout: vec![],
+            used: vec![],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 0,
+                threads: [64, 1, 1],
+            }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        };
+        let mut p = ir::build(&native.patched_code(), true, native.vgprs)?;
+        if fwd {
+            forward(&mut p);
+        }
+        let res = resource::track(&p, &native.layout, native.stage)?;
+        let io = io::raise(&p, &native)?;
+        let st = structure::structure(&p)?;
+        crate::emit::lower_compute(&native, &p, &st, &io, &res, per_lane_only)
+    }
+
     /// Assembled with llvm-mc (gfx1030, wave64): an `if` whose else-mask
     /// (`s_xor` of EXEC with the saved one: lanes elsewhere) is spilled to
     /// lanes 0 and 1 of v1 while s[2:3] is reused, then reloaded into
@@ -436,10 +461,23 @@ mod tests {
         for uses in idioms {
             let words = else_mask_spilled(uses);
             // The spill reads the mask as a number where its lanes are not.
-            match translate(&words, false) {
+            match lower_first(&words, false, true) {
                 Err(ShaderError::Unsupported { what, .. }) => assert_eq!(what, HOLDING),
                 r => panic!("{r:?}"),
             }
+            // Its lane reads and writes, in a program whose lanes branch
+            // differently, ask for the console flow, where the mask is a
+            // number and the spill ignores EXEC.
+            match lower_first(&words, false, false) {
+                Err(ShaderError::Unsupported { what, .. }) => {
+                    assert_eq!(what, crate::emit::CONSOLE_FLOW)
+                }
+                r => panic!("{r:?}"),
+            }
+            translate(&words, false).unwrap();
+            // Forwarded, the spill and reload are left out: the per-lane
+            // form, without asking for the console flow.
+            lower_first(&words, true, false).unwrap();
             translate(&words, true).unwrap();
         }
     }

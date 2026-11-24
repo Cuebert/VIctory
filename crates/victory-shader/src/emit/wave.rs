@@ -402,8 +402,9 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             (n @ ("v_permlane16_b32" | "v_permlanex16_b32"), Some(a)) => {
                 // Lane i of a row picks nibble i of {src2, src1}: from its
                 // own row (permlane16) or from the other row of its half of
-                // 32 lanes (permlanex16). Only with every lane active: the
-                // opsel bits (fi, bound_ctrl) decide what an inactive lane
+                // 32 lanes (permlanex16). Only with every lane active, or
+                // with fi (opsel bit 0), which reads an inactive lane as it
+                // is: otherwise bound_ctrl decides what an inactive lane
                 // reads.
                 let sel = |k: usize| match v.src.get(k) {
                     Some(&Operand::Const(c)) => crate::resource::inline(c),
@@ -411,7 +412,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                     _ => None,
                 };
                 match (sel(1), sel(2)) {
-                    (Some(s1), Some(s2)) if exec == all => {
+                    (Some(s1), Some(s2)) if exec == all || v.opsel & 1 != 0 => {
                         let s = u64::from(s1) | u64::from(s2) << 32;
                         (0..wave)
                             .map(|l| {
