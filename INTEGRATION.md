@@ -16,7 +16,7 @@ turned down upstream.
   the title. **Nobody has run this tree with the title yet.** It makes no
   claim about results in the title.
 - Update 3 adds #493, #483, #206, #469, #459, #454 and #579, and brings
-  the wave64 stack up to #439's head `e6936e3`.
+  the wave64 stack up to #439's head `d2189ff`.
 
 ## Reports from the title
 
@@ -37,7 +37,19 @@ with other builds than this tree. They were not repeated here.
   other PRs listed below. It also keeps 2^18 dynamic descriptor slots on
   a capped view heap, where that set had 2^16 (see "Changes made in this
   branch"). So a run of this tree with `VICTORY_SHADER_LOOP_LIMIT=32`
-  tells whether the result still holds here. Nobody has made that run.
+  tells whether the result still holds here. Nobody has made that run
+  with this tree.
+- **One tester's run with the wave64 stack in #189's place** (their own
+  merge, not this tree): on an RTX 5080, `d2a4bae` + #439 at `f653ea4`
+  + #493, #483, #89, #205, #206, #469, #459, #454 against the same set
+  with #189, loop limit 32, 262,144 dynamic slots on both, about 6
+  minutes in the world, one run each. Neither lost the device. With
+  the stack 958 draws per frame were dropped for want of a host
+  pipeline against 1,470, and the richest 2560x1440 G-buffer target
+  was 67.9% covered against 10.5%; the frame took 1,233 ms against
+  850 ms. With the stack the four instance-culling compute programs
+  named on issue #71 stop at `a structured buffer of unknown stride`
+  (Zignixx, upstream PR #439, comment 7123794194).
 - **If it hangs, try `VICTORY_SKIP_WAVE64=mesh,compute`** (#579,
   diagnostics build). It leaves out draws and dispatches of mesh and
   compute programs written for 64-lane waves, the compute programs the
@@ -193,7 +205,7 @@ and the name is its author's GitHub login.
   console flow on hosts without 64-lane waves
 - #320 (r4tedx): lane reads and writes where lanes branch differently
   run in the console flow, on every host
-- #439 (r4tedx), head `e6936e3`: one console wave sharing LDS runs in
+- #439 (r4tedx), head `d2189ff`: one console wave sharing LDS runs in
   the console flow. It carries peter-bonanni's commit `9b73d66`
   ("carry whole-wave integer scans across two 32-lane waves"):
   whole-wave sections across the two halves. It also carries `416714c`
@@ -212,6 +224,7 @@ and also on an AMD Radeon integrated GPU (64-lane waves). #439's five
 commits after `e49302a` (`a32c177`, `8876ed3`, `416714c`, `f653ea4`,
 `965ce30`) were picked onto the tree in update 3, in two merge commits,
 and its docs-only commit `2467891` and test-only commit `e6936e3` after them,
+then `d2189ff` (compute selects take masks held as numbers),
 and the shader tests ran again on both GPUs.
 
 **Validation failures, fixed by #180.** A whole-title
