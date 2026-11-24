@@ -108,6 +108,11 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
         MaxLOD: f32::MAX,
         ..Default::default()
     }];
+    // One test at a time, as the VALU tests run (#433): with these tests on
+    // the hardware adapter and WARP from several test threads at once, the
+    // test binary now and then dies of an access violation.
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = Vec::new();
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
