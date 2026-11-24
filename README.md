@@ -1,3 +1,27 @@
+# VIctory on Windows — sunlit prologue and Gone Fishing
+
+On 24 November 2026, cuebert independently reproduced a sunlit prison yard on Windows 11 with a GeForce RTX 5090. Walking to the guard advanced the mission. The player followed the guard, interacted at the teller counter, reached a vehicle inspection and entered Gone Fishing. The water and bridge were visible in the ordinary game window. The mission later reported that Cal had fallen overboard. Driving, boat control and completion of Gone Fishing remain unverified. [Original game-window screenshot](https://github.com/Cuebert/gta6-progress/blob/9fadc1cb03fa4887519909bf047d9c661d220f6e/images/gone-fishing-water-and-bridge.png) · [English journal](https://cuebert.github.io/gta6-progress/en/evidence.html#sunlit-world) · [中文日志](https://cuebert.github.io/gta6-progress/evidence.html#sunlit-world)
+
+The underlying VIctory engine is the work of Marvisak and the VIctory contributors. The sunlit world already rendered on the fxceless fork. Our original run added guarded file access, input support and GPU checks to that baseline. The changes and measurements below followed on separate builds. [VIctory](https://github.com/Marvisak/VIctory) · [Exact fxceless baseline](https://github.com/fxceless/victory-fork/commit/16849898f3282c4a7189b1557289c194bc720052)
+
+| Tested source | Observation |
+| --- | --- |
+| [Original gameplay run](https://github.com/Cuebert/VIctory/commit/91a836d7fe9eba32203ba596768408e3bb02ba80) | The mission sequence and screenshot above came from this build. A separate timing window in the same run recorded 300 game-frame intervals in 119.636 seconds, or 2.51 fps. Characters and shaded interiors often appeared very dark. |
+| [Texture update tracking](https://github.com/Cuebert/VIctory/commit/1f7ab62acf7b25c08f20edf64617410981c9329d) | Retaining older texture-write records allowed affected descriptors to be staged again during initial world streaming. |
+| [Intro texture and capture fix](https://github.com/Cuebert/VIctory/commit/c4e86c614899a04e465b5f24e856711b76057629) | During seconds 14–20, the original build produced 24 distinct game-window images in 164 capture deliveries. Asynchronous screenshot saving alone produced 26 in 179. Rechecking textures that changed through another memory mapping, with asynchronous saving on, produced 168 in 171. These are counts of distinct window images. |
+| [GPU-local buffer trial](https://github.com/Cuebert/VIctory/commit/e2295d071065455907191fd44bb676f7d8675152) | We tested the upstream GPU-local buffer option with a 1 MiB minimum and a 1,536 MiB budget. CPU buffer comparisons fell from roughly 350 MB to 28 MB per frame. Earlier world samples ran around 2.4–2.5 fps. The stationary trial ran around 3.0 fps with about 4,900 draws per frame. Concurrent workloads and scene differences limit this comparison. |
+| [Indirect-light shader integration](https://github.com/Cuebert/VIctory/commit/87c644c9a48bbe38841696bdc02756ded81c3e1b) | The primary and secondary irradiance-cache shading programs both translated, validated and created native D3D12 pipelines in an offline test. Scene lighting on this build still needs a verified game-window comparison. Shader translation changes come from cxchhh and the contributors to [fxceless PR 11](https://github.com/fxceless/victory-fork/pull/11). |
+
+For the intro comparison, Windows Graphics Capture sampled the game window at 160 × 90. We discarded the outer four pixels on each edge and counted distinct BLAKE2b digests during seconds 14–20 after the first captured frame. We enabled diagnostic frame saving in both runs. The original comparison used synchronous saving. The adaptive build used its default asynchronous saving and default texture guard. For the world buffer trial we set `VICTORY_CARD_BUFFERS_MIN_MB=1` and `VICTORY_CARD_BUFFERS_MB=1536`.
+
+Each source commit records the SHA-256 of the corresponding tested executable. To build a revision, check out that commit and run the following from a Windows x64 Rust/MSVC development environment. The upstream instructions below describe setup for a user-supplied game installation. The published source identifies the runtime used for each observation. The gameplay test also used a private read-only archive broker and controller harness.
+
+```console
+cargo build --locked --profile diag -p victory --features diagnostics --bin victory
+```
+
+## Upstream project notes
+
 # victory-gta6
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), the
