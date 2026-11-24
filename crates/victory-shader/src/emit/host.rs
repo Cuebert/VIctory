@@ -214,21 +214,53 @@ impl Host {
                 ShaderVisibility: vis,
             })
             .collect();
-        let mut views: Vec<(u8, bool)> = stages
+        // Root views by slot: constant buffers (0), then raw buffers read
+        // (1), then raw buffers written (2).
+        let mut views: Vec<(u8, u8)> = stages
             .iter()
             .flat_map(|(s, _)| {
-                let cbvs = s.root_cbvs.iter().map(|&r| (r, false));
-                cbvs.chain(s.root_srvs.iter().map(|&r| (r, true)))
+                let cbvs = s.root_cbvs.iter().map(|&r| (r, 0));
+                let srvs = s.root_srvs.iter().map(|&r| (r, 1));
+                cbvs.chain(srvs).chain(s.root_uavs.iter().map(|&r| (r, 2)))
             })
             .collect();
         views.sort_unstable();
         views.dedup();
-        for (slot, srv) in views {
+        let uav_ranges: Vec<_> = views
+            .iter()
+            .filter(|(_, kind)| *kind == 2)
+            .map(|&(slot, _)| D3D12_DESCRIPTOR_RANGE1 {
+                RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                NumDescriptors: 1,
+                BaseShaderRegister: u32::from(slot),
+                RegisterSpace: super::ROOT_CBV_SPACE,
+                Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                    | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                OffsetInDescriptorsFromTableStart: 0,
+            })
+            .collect();
+        let mut uav_ranges = uav_ranges.iter();
+        for (slot, kind) in views {
+            // Match the runtime's bounded, single-view UAV table.
+            if kind == 2 {
+                let range = uav_ranges.next().expect("range for each root UAV");
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                            NumDescriptorRanges: 1,
+                            pDescriptorRanges: range,
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                });
+                continue;
+            }
             params.push(D3D12_ROOT_PARAMETER1 {
-                ParameterType: if srv {
-                    D3D12_ROOT_PARAMETER_TYPE_SRV
-                } else {
+                ParameterType: if kind == 0 {
                     D3D12_ROOT_PARAMETER_TYPE_CBV
+                } else {
+                    D3D12_ROOT_PARAMETER_TYPE_SRV
                 },
                 Anonymous: D3D12_ROOT_PARAMETER1_0 {
                     Descriptor: D3D12_ROOT_DESCRIPTOR1 {
@@ -239,6 +271,31 @@ impl Host {
                 },
                 ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
             });
+        }
+        // The address map, then the descriptor words, come last.
+        for (wanted, space) in [
+            (
+                stages.iter().any(|(s, _)| s.address_map),
+                super::ADDRESS_MAP_SPACE,
+            ),
+            (
+                stages.iter().any(|(s, _)| s.descriptor_words),
+                super::DESCRIPTOR_WORDS_SPACE,
+            ),
+        ] {
+            if wanted {
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                            ShaderRegister: 0,
+                            RegisterSpace: space,
+                            Flags: D3D12_ROOT_DESCRIPTOR_FLAG_NONE,
+                        },
+                    },
+                    ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+                });
+            }
         }
         let mut samplers = Vec::new();
         for &(s, vis) in stages {
@@ -610,6 +667,9 @@ fn stub(pixel: bool, outputs: Vec<SigElement>) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: Vec::new(),
         root_srvs: Vec::new(),
+        address_map: false,
+        descriptor_words: false,
+        root_uavs: Vec::new(),
     }
 }
 
@@ -1006,6 +1066,8 @@ pub enum View<'a> {
     Depth(u32, u32, &'a [f32]),
     /// A raw buffer UAV of this many dwords, zeroed.
     RawUav(u32),
+    /// A raw buffer UAV holding these dwords (read back like `RawUav`).
+    RawData(&'a [u32]),
     /// An RGBA32F texture UAV (width, height), zeroed.
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
@@ -1361,7 +1423,7 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::HalfUav(_) => {
+                    View::RawUav(_) | View::HalfUav(_) | View::RawData(_) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
@@ -1371,6 +1433,10 @@ impl Host {
                                 D3D12_BUFFER_UAV_FLAG_NONE,
                             ),
                             View::RawUav(n) => {
+                                (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
+                            }
+                            View::RawData(d) => {
+                                let n = d.len() as u32;
                                 (n, DXGI_FORMAT_R32_TYPELESS, n, D3D12_BUFFER_UAV_FLAG_RAW)
                             }
                             _ => unreachable!(),
@@ -1393,6 +1459,17 @@ impl Host {
                             },
                         };
                         dev.CreateUnorderedAccessView(&b, None, Some(&desc), at);
+                        if let View::RawData(d) = *v {
+                            // The copy promotes the buffer to a copy target.
+                            let up = upload(d)?;
+                            list.CopyBufferRegion(&b, 0, &up, 0, bytes);
+                            list.ResourceBarrier(&[transition(
+                                &b,
+                                D3D12_RESOURCE_STATE_COPY_DEST,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            )]);
+                            keep.push(up);
+                        }
                         let rb = make(
                             D3D12_HEAP_TYPE_READBACK,
                             &buffer(bytes, D3D12_RESOURCE_FLAG_NONE),

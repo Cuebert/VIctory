@@ -67,6 +67,19 @@ pub(crate) fn heap<'a>(this: This) -> &'a Heap {
 }
 
 impl Heap {
+    #[cfg(all(windows,feature="diagnostics"))]
+    pub(crate) fn material_view(&self,index:u32)->Option<(u64,View)> {
+        let host=self.host()?;
+        if self.desc.kind!=VIEWS_KIND || index>=host.count() || index>=self.desc.count {return None}
+        let handle=self.start.checked_add(u64::from(index)*u64::from(increment(self.desc.kind)?))?;
+        if self.index(handle.checked_add(11)?)!=Some(index){return None}
+        let mut words=[0u8;12];
+        if !crate::host::read_into(handle as *const u8,&mut words){return None}
+        let word=|at|u32::from_le_bytes(words[at..at+4].try_into().unwrap());
+        if word(0)!=VIEW_TAG{return None}
+        let (i,generation)=(word(4),word(8));
+        Some((u64::from(generation)<<32|u64::from(i),view_at(i,generation)?))
+    }
     /// Whether this is a sampler heap.
     pub(crate) fn samplers(&self) -> bool {
         self.desc.kind == SAMPLERS
@@ -669,6 +682,28 @@ static FUNCTIONS: Table<24> = {
 };
 
 #[cfg(test)]
+pub(crate) fn test_view_heap(count: u32) -> This {
+    #[repr(C)]
+    struct Extended(HeapDesc, Placement);
+    let extended = Extended(
+        HeapDesc {
+            kind: VIEWS_KIND,
+            count,
+            flags: SHADER_VISIBLE,
+            nodes: 0,
+        },
+        Placement {
+            address: 0,
+            size: 0,
+        },
+    );
+    let mut heap = std::ptr::null();
+    let hr = create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], &mut heap);
+    assert_eq!(hr, crate::object::S_OK);
+    heap
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
@@ -681,6 +716,33 @@ mod tests {
     fn create(desc: HeapDesc, placement: Placement, out: &mut This) -> HRESULT {
         let extended = Extended(desc, placement);
         create_heap(std::ptr::null(), &extended.0, &HEAP_IIDS[0], out)
+    }
+
+    #[cfg(all(windows,feature="diagnostics"))]
+    #[test]
+    fn material_record_prepares_only_the_selected_bc_descriptor() {
+        let null=std::ptr::null();
+        let mut h=null;
+        assert_eq!(create(HeapDesc{kind:0,count:8,flags:1,nodes:0},Placement{address:0,size:0},&mut h),S_OK);
+        let heap=heap(h);
+        let host=heap.host().expect("fixture requires a D3D12 device");
+        let source=vec![0u8;2*65536];
+        let address=(source.as_ptr() as u64).next_multiple_of(65536);
+        let mut desc=[0u32;14];
+        desc[0]=3;desc[4]=4;desc[6]=4;desc[7]=0x10001;desc[8]=71;desc[9]=1;
+        let mut srv=[0u32;16];
+        srv[0]=71;srv[1]=4;srv[2]=5768;srv[5]=1;srv[10]=address as u32;srv[11]=(address>>32) as u32;
+        for slot in [2u64,5] {create_placed_srv(null,&desc,&srv,heap.start+32*slot)}
+        let (key,selected)=heap.material_view(5).expect("registered BC1 view");
+        assert!(heap.material_view(8).is_none() && heap.material_view(3).is_none());
+        assert!(host.trace_texture(2).is_none() && host.trace_texture(5).is_none());
+        assert!(host.materialize_texture(5,key,&selected));
+        let installed=host.trace_texture(5).expect("real BC1 host texture");
+        assert!(host.materialize_texture(5,key,&selected));
+        assert_eq!(host.trace_texture(5),Some(installed));
+        assert!(host.trace_texture(2).is_none());
+        unsafe{crate::host::host().unwrap().device.GetDeviceRemovedReason().unwrap()};
+        slot::<extern "system" fn(This)->u32>(h,0x10)(h);
     }
 
     #[test]

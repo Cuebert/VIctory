@@ -38,6 +38,43 @@ pub struct Address {
 /// offset is then the byte offset in the code.
 pub const CODE: usize = usize::MAX;
 
+/// [`Address::param`] of an address only known when the program runs: a
+/// pointer it loads from memory, picks by control flow or computes (a
+/// ray-tracing traversal follows the pointers in its BVH). The lowering
+/// rebuilds the 64-bit address from the instruction's own operands and
+/// reads title memory through the address map; `offset` and `dynamic`
+/// are unused.
+pub const GLOBAL: usize = usize::MAX - 1;
+
+/// Why an address has no root parameter, when the program computes it
+/// from values a translation can reproduce: such an access reads title
+/// memory at that address ([`GLOBAL`]). An address in an SGPR the
+/// hardware fills (the console's spill table, say) has no host value, so
+/// that case stays a refusal, as do the code-relative ones.
+fn runtime_address(why: &str) -> bool {
+    matches!(
+        why,
+        "an address not from a root parameter"
+            | "an address from a phi"
+            | "an address loaded from memory"
+            | "an address with two computed terms"
+            | "an address from a root parameter that is no address"
+    )
+}
+
+/// The address of a memory access, or [`GLOBAL`] when [`runtime_address`]
+/// says why it has none.
+fn or_global(a: Result<Address, &'static str>) -> Result<Address, &'static str> {
+    match a {
+        Err(why) if runtime_address(why) => Ok(Address {
+            param: GLOBAL,
+            offset: 0,
+            dynamic: None,
+        }),
+        a => a,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     /// Dwords `first..` of what the scalar load at `load` reads (see
@@ -177,6 +214,9 @@ pub fn track(
                 Ok(())
             };
             match &inst.fields {
+                // The BVH descriptor is read as data (its base address and
+                // flags): no host view stands for it.
+                Fields::Image { .. } if inst.name().starts_with("image_bvh") => {}
                 Fields::Image { rsrc, sampler, .. } => {
                     descriptor(rsrc, Role::Resource)?;
                     if let Some(s) = sampler {
@@ -193,7 +233,8 @@ pub fn track(
                     soffset,
                     ..
                 } if inst.name().contains("_load_") || inst.name().contains("_store_") => {
-                    let address = t.smem_address(inst, base, *offset, soffset).map_err(fail)?;
+                    let address =
+                        or_global(t.smem_address(inst, base, *offset, soffset)).map_err(fail)?;
                     out.scalar.push((site, address));
                 }
                 Fields::Flat {
@@ -202,9 +243,9 @@ pub fn track(
                     offset,
                     ..
                 } if inst.name().starts_with("global_") => {
-                    let address = t
-                        .flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset)
-                        .map_err(fail)?;
+                    let address =
+                        or_global(t.flat_address(inst, addr.as_ref(), saddr.as_ref(), *offset))
+                            .map_err(fail)?;
                     out.scalar.push((site, address));
                 }
                 _ => {}
@@ -577,6 +618,32 @@ impl<'a> Tracer<'a> {
                 let (Some(lo), Some(hi)) = (word(0), word(1)) else {
                     return Err("a global address");
                 };
+                // A matrix address in LoadTriangles is supplied as adjacent
+                // dwords inside a declared root-constant array. Only agree to
+                // the bounded GPU address map when both input dwords are
+                // reproducible and belong to the same constant parameter.
+                let root_word = |term| {
+                    let Term::Value(v) = term else { return None };
+                    self.param_of(self.inputs[v.0 as usize]?)
+                };
+                let float_atomic =
+                    matches!(inst.name(), "global_atomic_fmin" | "global_atomic_fmax");
+                if self.stage == HwStage::Cs
+                    && (inst.name().starts_with("global_load_") || float_atomic)
+                    && let (Some((p, low)), Some((q, high))) = (root_word(lo), root_word(hi))
+                    && p == q
+                    && low.checked_add(1) == Some(high)
+                    && (self.layout[p].root == RootType::Constants
+                        || (float_atomic
+                            && self.layout[p].root == RootType::Descriptor
+                            && low == 0))
+                {
+                    return Ok(Address {
+                        param: GLOBAL,
+                        offset: 0,
+                        dynamic: None,
+                    });
+                }
                 self.address(
                     lo,
                     hi,
@@ -702,6 +769,152 @@ impl<'a> Tracer<'a> {
         }
     }
 
+    /// Maximum byte offset for a uniform multiplication or left shift of a
+    /// bit-field-extracted scalar. Both the uniformity and the bound
+    /// are required before reading a table in the immutable shader.
+    fn uniform_table_bound(&self, value: Value, anchor: &Inst, depth: u8) -> Option<u32> {
+        let d = self.def(value)?;
+        let Fields::Valu(f) = &d.fields else {
+            return None;
+        };
+        if depth == 0
+            || f.abs != 0
+            || f.neg != 0
+            || f.dpp.is_some()
+            || f.sdwa.is_some()
+            || [Reg::S(crate::ir::EXEC), Reg::S(crate::ir::EXEC + 1)]
+                .into_iter()
+                .any(|r| d.read(r) != anchor.read(r))
+        {
+            return None;
+        }
+        let bound = |op: &Operand| -> Option<u32> {
+            if let Operand::Vector { reg, .. } = *op {
+                return self.uniform_table_bound(d.read(Reg::V(reg))?, anchor, depth - 1);
+            }
+            match self.term(d, op)? {
+                Term::Const(x) => Some(x),
+                Term::Value(v) => {
+                    let (_, terms) = self.sop2(v, &["s_bfe_u32"])?;
+                    let Term::Const(bits) = terms[1] else {
+                        return None;
+                    };
+                    let shift = bits & 31;
+                    let width = ((bits >> 16) & 127).min(32 - shift);
+                    u32::try_from((1u64 << width) - 1).ok()
+                }
+            }
+        };
+        match (d.name(), f.src.as_slice()) {
+            ("v_mul_u32_u24", [a, b]) => {
+                bound(a)?.min(0xffffff).checked_mul(bound(b)?.min(0xffffff))
+            }
+            ("v_lshlrev_b32", [a, b]) => {
+                let Term::Const(shift) = self.term(d, a)? else {
+                    return None;
+                };
+                bound(b)?.checked_mul(1u32 << (shift & 31))
+            }
+            ("v_mov_b32", [a]) => bound(a),
+            _ => None,
+        }
+    }
+
+    /// A code-table address assembled in VGPRs from GETPC + a constant +
+    /// a uniform index and carried to the scalar load with two readfirstlane
+    /// instructions. It may only read the shader container's immutable code.
+    fn first_lane_code_table(&self, lo: Term, hi: Term, offset: i32, width: u8) -> Option<Address> {
+        let (Term::Value(lo), Term::Value(hi)) = (lo, hi) else {
+            return None;
+        };
+        let low_read = self.def(lo)?;
+        let high_read = self.def(hi)?;
+        let low = self.first_lane_source(lo)?;
+        let high = self.first_lane_source(hi)?;
+        let low_add = self.def(low)?;
+        let high_add = self.def(high)?;
+        if low_add.name() != "v_add_co_u32" || high_add.name() != "v_add_co_ci_u32" {
+            return None;
+        }
+        for r in [Reg::S(crate::ir::EXEC), Reg::S(crate::ir::EXEC + 1)] {
+            let mask = low_add.read(r);
+            if high_add.read(r) != mask || low_read.read(r) != mask || high_read.read(r) != mask {
+                return None;
+            }
+        }
+        let (Fields::Valu(a), Fields::Valu(b)) = (&low_add.fields, &high_add.fields) else {
+            return None;
+        };
+        if b.sdwa.is_some() || b.dpp.is_some() || b.abs != 0 || b.neg != 0 {
+            return None;
+        }
+        let Operand::Scalar { code: carry, .. } = a.carry? else {
+            return None;
+        };
+        if !matches!(b.src.get(2),Some(Operand::Scalar{code,..}) if *code==carry)
+            || low_add.write(Reg::S(carry)) != high_add.read(Reg::S(carry))
+        {
+            return None;
+        }
+        let [low_a, low_b] = self.vadd(low)?;
+        let hi_a = self.vterm(high_add, b.src.first()?)?;
+        let hi_b = self.vterm(high_add, b.src.get(1)?)?;
+        let base_hi = match (hi_a, hi_b) {
+            (Term::Const(0), h) | (h, Term::Const(0)) => h,
+            _ => return None,
+        };
+        for (base, index) in [(low_a, low_b), (low_b, low_a)] {
+            let Term::Value(index) = index else { continue };
+            let Some(max) = self.uniform_table_bound(index, low_add, 4) else {
+                continue;
+            };
+            let (Term::Value(base), Term::Value(upper)) = (base, base_hi) else {
+                continue;
+            };
+            let Some((scalar_add, terms)) = self.sop2(base, &["s_add_u32"]) else {
+                continue;
+            };
+            let Some((scalar_carry, high_terms)) = self.sop2(upper, &["s_addc_u32"]) else {
+                continue;
+            };
+            if scalar_add.write(Reg::Scc).is_none()
+                || scalar_add.write(Reg::Scc) != scalar_carry.read(Reg::Scc)
+            {
+                continue;
+            }
+            let (pc, delta) = match terms {
+                [Term::Value(v), Term::Const(n)] | [Term::Const(n), Term::Value(v)] => (v, n),
+                _ => continue,
+            };
+            let Some(pc) = self.getpc(pc) else { continue };
+            let hi = Term::Value(pc.writes.get(1)?.1);
+            if high_terms != [hi, Term::Const(0)] && high_terms != [Term::Const(0), hi] {
+                continue;
+            }
+            let data = (pc.machine.offset as u32)
+                .checked_add(4)?
+                .checked_add(delta)?
+                .checked_add_signed(offset)?;
+            let last = self
+                .p
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .map(|i| i.machine.offset + i.machine.words.len() * 4)
+                .max()?;
+            let end = u64::from(data) + u64::from(max) + 4 * u64::from(width);
+            if !data.is_multiple_of(4) || (data as usize) < last || end > self.p.code_bytes as u64 {
+                continue;
+            }
+            return Some(Address {
+                param: CODE,
+                offset: data,
+                dynamic: Some(index),
+            });
+        }
+        None
+    }
+
     fn smem_address(
         &self,
         inst: &Inst,
@@ -716,6 +929,18 @@ impl<'a> Tracer<'a> {
         let (Some(lo), Some(hi)) = (word(0), word(1)) else {
             return Err("an address not in SGPRs");
         };
+        if matches!(
+            soffset,
+            Operand::Scalar { code: NULL, .. } | Operand::Const(128)
+        ) && inst.name().starts_with("s_load_dword")
+            && let Fields::Smem {
+                data: Some(Operand::Scalar { dwords: width, .. }),
+                ..
+            } = &inst.fields
+            && let Some(a) = self.first_lane_code_table(lo, hi, offset, *width)
+        {
+            return Ok(a);
+        }
         let mut extra = self.sum(
             self.term(inst, soffset)
                 .ok_or("an unknown offset operand")?,

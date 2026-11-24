@@ -113,8 +113,8 @@ fn dxc_library() -> windows::core::Result<windows::Win32::Foundation::HMODULE> {
     }
 }
 
-/// Compiles a compute shader with DXC (see [`dxc_library`]).
-fn dxc_compile(source: &str) -> windows::core::Result<Vec<u8>> {
+/// Compiles an internal shader with DXC (see [`dxc_library`]).
+pub(crate) fn dxc_compile(source: &str, profile: windows::core::PCWSTR) -> windows::core::Result<Vec<u8>> {
     use windows::Win32::Graphics::Direct3D::Dxc::*;
     use windows::Win32::System::LibraryLoader::GetProcAddress;
     use windows::core::{Interface, w};
@@ -139,7 +139,7 @@ fn dxc_compile(source: &str) -> windows::core::Result<Vec<u8>> {
             Size: source.len(),
             Encoding: DXC_CP_UTF8.0,
         };
-        let arguments = [w!("-T"), w!("cs_6_0"), w!("-E"), w!("main"), w!("-O3")];
+        let arguments = [w!("-T"), profile, w!("-E"), w!("main"), w!("-O3")];
         let result: IDxcResult = compiler.Compile(&buffer, Some(&arguments), None)?;
         if let Err(e) = result.GetStatus()?.ok() {
             if let Ok(errors) = result.GetErrorBuffer() {
@@ -148,7 +148,7 @@ fn dxc_compile(source: &str) -> windows::core::Result<Vec<u8>> {
                     errors.GetBufferSize(),
                 );
                 tracing::warn!(
-                    "argument clamp: DXC: {}",
+                    "DXC: {}",
                     String::from_utf8_lossy(text).trim()
                 );
             }
@@ -220,7 +220,7 @@ fn make() -> windows::core::Result<Clamp> {
             };
             tracing::info!(error = %e, "argument clamp: the system compiler refused it ({}); trying DXC", String::from_utf8_lossy(text).trim());
         }
-        fallback = dxc_compile(SOURCE)
+        fallback = dxc_compile(SOURCE, windows::core::w!("cs_6_0"))
             .inspect_err(|e| tracing::warn!(error = %e, "argument clamp: DXC failed too"))?;
     } else {
         fallback = Vec::new();
@@ -312,7 +312,7 @@ pub(crate) fn execute(
     };
 }
 
-fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
+pub(crate) fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,

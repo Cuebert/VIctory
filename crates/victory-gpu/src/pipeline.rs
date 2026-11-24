@@ -60,9 +60,15 @@ pub(crate) struct Shader {
     pub(crate) stage: &'static str,
     /// The first 8 bytes of its BLAKE3, as logged.
     pub(crate) hash: String,
+    #[cfg(windows)]
+    exact_counter_reset: bool,
+    #[cfg(windows)]
+    pub(crate) exact_triangle_builder: bool,
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    #[cfg(all(windows, feature = "diagnostics"))]
+    trace_resources: OnceLock<Result<Vec<victory_shader::UsedResource>, String>>,
     /// Whether its native program runs in 64-lane console waves
     /// (diagnostics: `VICTORY_SKIP_WAVE64`).
     #[cfg(all(windows, feature = "diagnostics"))]
@@ -89,9 +95,19 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
             Arc::new(Shader {
                 stage,
                 hash: full.to_hex()[..16].to_owned(),
+                #[cfg(windows)]
+                exact_counter_reset: bytes.len() == 4072
+                    && full.to_hex().as_str()
+                        == "3b90165a77d95cdff2246325555a2f32d5c1fa18e0d227d9e9745a11bf25e4fb",
+                #[cfg(windows)]
+                exact_triangle_builder: bytes.len() == 41732
+                    && full.to_hex().as_str()
+                        == "f6e47efa50226beb5574b5038367bffebcb40affe88b4c787e78fcb77b1a60c9",
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(all(windows, feature = "diagnostics"))]
+                trace_resources: OnceLock::new(),
                 #[cfg(all(windows, feature = "diagnostics"))]
                 wave64: OnceLock::new(),
             })
@@ -108,6 +124,9 @@ pub(crate) struct Translated {
 
 #[cfg(windows)]
 impl Shader {
+    pub(crate) fn exact_counter_reset(&self) -> bool {
+        self.exact_counter_reset
+    }
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
@@ -137,9 +156,15 @@ impl Shader {
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
-    use victory_shader::{Container, FourCC, HwStage};
     let target = crate::host::host().map_or(victory_shader::emit::Target::ANY, |h| h.target());
     let host = crate::shader_cache::host_shader(container, target)?;
+    let used = shader_resources(container)?;
+    Ok(Translated { host, used })
+}
+
+#[cfg(windows)]
+fn shader_resources(container: &[u8]) -> Result<Vec<victory_shader::UsedResource>, String> {
+    use victory_shader::{Container, FourCC, HwStage};
     let c = Container::parse(container).map_err(|e| e.to_string())?;
     let used = match c.part(FourCC::DXIL) {
         Some(part) => victory_shader::native_programs(part.data)
@@ -155,7 +180,41 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
             .unwrap_or_default(),
         None => Vec::new(),
     };
-    Ok(Translated { host, used })
+    Ok(used)
+}
+
+/// Console shader metadata remains available when the host refuses a pipeline.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn trace_bindings<'a>(this: This) -> impl Iterator<Item = (&'a Shader, Option<&'a [victory_shader::UsedResource]>)> {
+    let stages = if this.is_null() { &[][..] } else { &pipeline(this).shaders[..] };
+    stages.iter().map(|shader| {
+        let uses = shader.trace_resources.get_or_init(|| shader_resources(&shader.container));
+        (shader.as_ref(), uses.as_ref().ok().map(Vec::as_slice))
+    })
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn contains_shader(this: This, hash: u64) -> bool {
+    !this.is_null() && pipeline(this).shaders.iter().any(|s| u64::from_str_radix(&s.hash, 16) == Ok(hash))
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn trace_stages(this: This) -> Option<Arc<str>> {
+    if this.is_null() { return None; }
+    let pipeline = pipeline(this);
+    Some(pipeline.trace_stages.get_or_init(|| {
+        pipeline.shaders.iter().map(|s| format!(" | {} {}", s.stage, s.hash)).collect::<String>().into()
+    }).clone())
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn trace_uavs<'a>(this: This) -> &'a [victory_shader::UsedResource] {
+    use victory_shader::{ResourceType, RootType};
+    if this.is_null() { return &[]; }
+    pipeline(this).trace_uavs.get_or_init(|| {
+        trace_bindings(this).filter_map(|(_, uses)| uses).flatten()
+            .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table).copied().collect()
+    })
 }
 
 #[repr(C)]
@@ -164,6 +223,10 @@ struct Pipeline {
     packet: [u32; 8],
     /// Each used stage's container.
     shaders: Vec<Arc<Shader>>,
+    #[cfg(all(windows, feature = "diagnostics"))]
+    trace_stages: OnceLock<Arc<str>>,
+    #[cfg(all(windows, feature = "diagnostics"))]
+    trace_uavs: OnceLock<Vec<victory_shader::UsedResource>>,
     /// Whether a list has bound it yet (its shaders are logged then).
     bound: std::sync::atomic::AtomicBool,
     /// What its host pipeline is made from, and the host pipeline once made
@@ -369,6 +432,10 @@ fn hand_out(
         #[cfg(windows)]
         host,
         shaders,
+        #[cfg(all(windows, feature = "diagnostics"))]
+        trace_stages: OnceLock::new(),
+        #[cfg(all(windows, feature = "diagnostics"))]
+        trace_uavs: OnceLock::new(),
         bound: std::sync::atomic::AtomicBool::new(false),
     });
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)

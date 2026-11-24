@@ -1,0 +1,251 @@
+//! The address map translated shaders read title memory through when they
+//! compute its address (a pointer they load, the BVH a ray-tracing pass
+//! walks): see `victory_shader::emit::address_map` for its layout. It
+//! lists registered backed buffers whose exact allocation can be retained
+//! for the recorded list, through dynamic slots of its view heap.
+//!
+//! shortcut: every copy is brought up to date (the pages the title wrote
+//! since) once per list that binds the map, and what shaders write through
+//! it stays in the copies (it is not copied back to title memory: the BVH
+//! the title builds on the GPU is only read on the GPU). A list of copies
+//! that grows into the thousands makes that refresh the cost to watch.
+
+use victory_shader::emit::address_map::{ENTRY, HEADER, READ, Range, WRITE, encode};
+
+use crate::descriptor::host::{HostHeap, MapSlots};
+use crate::host::HostList;
+
+/// The most bytes one raw view holds: D3D12 buffer views have at most 2^27
+/// elements.
+const VIEW_BYTES: u64 = 4 << 27;
+
+/// Pieces of title memory the spans `(start, len)` cover, sorted and not
+/// overlapping, each with the span that holds it: where spans overlap, the
+/// one starting last (the innermost buffer, as [`crate::shadow::find`]
+/// picks) holds the piece.
+pub(crate) fn pieces(spans: &[(u64, u64)]) -> Vec<(u64, u64, usize)> {
+    // (address, whether a span starts there, span): ends before starts.
+    let mut points: Vec<(u64, bool, usize)> = Vec::with_capacity(2 * spans.len());
+    for (i, &(start, len)) in spans.iter().enumerate() {
+        if len > 0 {
+            points.push((start, true, i));
+            points.push((start.saturating_add(len), false, i));
+        }
+    }
+    points.sort_unstable();
+    let mut active = std::collections::BTreeSet::new();
+    let mut out: Vec<(u64, u64, usize)> = Vec::new();
+    let mut at = 0;
+    for (x, starts, i) in points {
+        if x > at
+            && let Some(&(_, holder)) = active.iter().next_back()
+        {
+            match out.last_mut() {
+                Some(last) if last.2 == holder && last.0 + last.1 == at => last.1 += x - at,
+                _ => out.push((at, x - at, holder)),
+            }
+        }
+        if starts {
+            active.insert((spans[i].0, i));
+        } else {
+            active.remove(&(spans[i].0, i));
+        }
+        at = x;
+    }
+    out
+}
+
+/// The map's entries for `pieces` of the spans: each piece cut where its
+/// span's views ([`VIEW_BYTES`] each) end, with the view (span, view number
+/// within the span) and the piece's offset in that view.
+fn entries(
+    spans: &[(u64, u64)],
+    pieces: &[(u64, u64, usize)],
+) -> Vec<(u64, u32, (usize, u64), u32)> {
+    let mut out = Vec::new();
+    for &(start, len, span) in pieces {
+        let mut at = start;
+        let end = start + len;
+        while at < end {
+            let rel = at - spans[span].0;
+            let view = rel / VIEW_BYTES;
+            let view_end = spans[span].0 + (view + 1) * VIEW_BYTES;
+            let next = end.min(view_end);
+            out.push((
+                at,
+                (next - at) as u32,
+                (span, view),
+                (rel - view * VIEW_BYTES) as u32,
+            ));
+            at = next;
+        }
+    }
+    out
+}
+
+/// The address map for draws of `list` while `heap` is its view heap: its
+/// host GPU address, and the dynamic slots its views take (to give back
+/// when the list is reset). Each copy is brought up to date when the list
+/// is submitted.
+pub(crate) fn make(list: &HostList, heap: &HostHeap) -> Option<(u64, u64, Option<MapSlots>, MapTotals)> {
+    let (generation, copies) = crate::shadow::map_sources()?;
+    let spans: Vec<(u64, u64)> = copies.iter().map(|(c, _)| c.span()).collect();
+    let pieces = pieces(&spans);
+    let entries = entries(&spans, &pieces);
+    let mut views: Vec<(usize, u64)> = entries.iter().map(|e| e.2).collect();
+    views.sort_unstable();
+    views.dedup();
+    let n = u32::try_from(views.len()).ok()?;
+    // The shader uses u32 byte offsets. Bound the table and finish scratch
+    // reservation before writing descriptors or retaining allocations.
+    if entries.len() > 65536 {
+        return None;
+    }
+    let bytes = u64::from(HEADER) + u64::from(ENTRY) * entries.len().max(1) as u64;
+    let slots = if n == 0 { None } else { Some(heap.map_slots(n)?) };
+    let first = slots.as_ref().map_or(0, |s| s.first);
+    let (gpu, to) = list.scratch(bytes)?;
+    for (k, &(span, view)) in views.iter().enumerate() {
+        let copy = &copies[span].0;
+        let offset = view * VIEW_BYTES;
+        let bytes = (copy.span().1 - offset).min(VIEW_BYTES).next_multiple_of(4);
+        heap.raw_uav_at(
+            first + k as u32,
+            &copy.buffer,
+            offset / 4,
+            (bytes / 4) as u32,
+        );
+    }
+    for (c, _) in &copies {
+        let (start, len) = c.span();
+        c.refresh(list, start, len);
+    }
+    let ranges: Vec<Range> = entries
+        .iter()
+        .map(|&(start, len, view, view_offset)| Range {
+            start,
+            len,
+            view: first + views.binary_search(&view).expect("listed") as u32,
+            view_offset,
+            access: map_access(copies[view.0].1),
+        })
+        .collect();
+    let words = encode(&ranges);
+    // Room for one entry even when there is none: the shader reads it.
+    // SAFETY: `bytes` of the list's upload memory, which outlives the
+    // list's run; the words fit.
+    unsafe {
+        std::ptr::write_bytes(to, 0, bytes as usize);
+        std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), to, words.len() * 4);
+    }
+    Some((generation, gpu, slots, MapTotals::from_ranges(&ranges)))
+}
+
+#[derive(Clone,Copy,Default,Debug)]
+pub(crate) struct MapTotals {
+    #[cfg(feature="diagnostics")]
+    pub ranges:usize,
+    #[cfg(feature="diagnostics")]
+    pub readable:u64,
+    #[cfg(feature="diagnostics")]
+    pub writable:u64,
+}
+impl MapTotals {
+    fn from_ranges(_ranges:&[Range])->Self {
+        #[cfg(feature="diagnostics")]
+        {return Self{ranges:_ranges.len(),
+            readable:_ranges.iter().filter(|r|r.access & READ != 0).map(|r|u64::from(r.len)).sum(),
+            writable:_ranges.iter().filter(|r|r.access & WRITE != 0).map(|r|u64::from(r.len)).sum()}}
+        #[cfg(not(feature="diagnostics"))]
+        Self{}
+    }
+}
+
+#[cfg(feature="diagnostics")]
+pub(crate) fn trace_laser(list:&HostList,hash:&str,outcome:&'static str,totals:Option<MapTotals>){
+    if hash!="32ed072b9f845048" || !crate::capture::dump_on(){return}
+    let recorded=crate::queue::presented()+1;
+    list.defer_host(move||{
+        let frame=crate::queue::presented()+1;
+        if crate::capture::listed(frame){
+            let (ranges,readable,writable)=match totals {Some(t)=>(Some(t.ranges),Some(t.readable),Some(t.writable)),None=>(None,None,None)};
+            tracing::info!(frame,recorded,outcome,?ranges,?readable,?writable,"laser shadow stage registered address map");
+            static LAST_FRAME: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+            if LAST_FRAME.swap(frame, std::sync::atomic::Ordering::Relaxed) != frame {
+                crate::shadow::report_map_backing(frame);
+            }
+        }
+    });
+}
+
+fn map_access(flags: u32) -> u32 {
+    let read = if flags & 8 == 0 { READ } else { 0 }; // DENY_SHADER_RESOURCE
+    let write = if flags & 4 != 0 { WRITE } else { 0 }; // ALLOW_UNORDERED_ACCESS
+    read | write
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature="diagnostics")]
+    #[test]
+    fn reported_totals_count_read_and_write_access_independently(){
+        let range=|start,len,access|Range{start,len,access,view:0,view_offset:0};
+        let totals=MapTotals::from_ranges(&[range(0,16,READ),range(16,32,WRITE),range(48,48,READ|WRITE)]);
+        assert_eq!((totals.ranges,totals.readable,totals.writable),(3,64,80));
+    }
+
+    #[test]
+    fn registered_view_permissions_follow_the_resource() {
+        assert_eq!(map_access(0), READ);
+        assert_eq!(map_access(4), READ | WRITE);
+        assert_eq!(map_access(4 | 8), WRITE);
+    }
+
+    #[test]
+    fn inner_buffers_win_and_pieces_do_not_overlap() {
+        // A heap-sized buffer with two placed inside it, one past its end,
+        // and an empty one.
+        let spans = [
+            (0x1000, 0x1000),
+            (0x1200, 0x100),
+            (0x1800, 0x100),
+            (0x3000, 0x40),
+            (0x5000, 0),
+        ];
+        assert_eq!(
+            pieces(&spans),
+            [
+                (0x1000, 0x200, 0),
+                (0x1200, 0x100, 1),
+                (0x1300, 0x500, 0),
+                (0x1800, 0x100, 2),
+                (0x1900, 0x700, 0),
+                (0x3000, 0x40, 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn the_same_span_twice_is_one_piece() {
+        assert_eq!(
+            pieces(&[(0x100, 0x100), (0x100, 0x100)]),
+            [(0x100, 0x100, 1)]
+        );
+    }
+
+    #[test]
+    fn pieces_are_cut_where_views_end() {
+        let spans = [(0x10, 2 * VIEW_BYTES + 8)];
+        let e = entries(&spans, &pieces(&spans));
+        assert_eq!(
+            e,
+            [
+                (0x10, VIEW_BYTES as u32, (0, 0), 0),
+                (0x10 + VIEW_BYTES, VIEW_BYTES as u32, (0, 1), 0),
+                (0x10 + 2 * VIEW_BYTES, 8, (0, 2), 0),
+            ]
+        );
+    }
+}

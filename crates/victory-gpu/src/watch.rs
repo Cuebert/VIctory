@@ -70,12 +70,35 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             &mut granularity,
         )
     } != 0;
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        let ns = started.elapsed().as_nanos() as u64;
+        let (calls, duration) = if failed {
+            (C::KernelWatchMisses, C::KernelWatchMissNs)
+        } else {
+            crate::copystat::private_watch(first, last, ns);
+            (C::KernelWatchHits, C::KernelWatchHitNs)
+        };
+        add(calls, 1);
+        add(duration, ns);
+    }
     let guarded = if failed {
         count = 0;
         if !guarded {
             return None;
         }
-        guard(first * PAGE, last * PAGE)?
+        #[cfg(feature = "diagnostics")]
+        let began = std::time::Instant::now();
+        let answer = guard(first * PAGE, last * PAGE);
+        #[cfg(feature = "diagnostics")]
+        {
+            use crate::copystat::{C, add};
+            let ns = began.elapsed().as_nanos() as u64;
+            add(C::GuardCalls, 1);
+            add(C::GuardNs, ns);
+        }
+        answer?
     } else {
         Vec::new()
     };
@@ -100,6 +123,26 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     ))
 }
 
+/// A completed GPU readback changed the original section through an
+/// independent view. Record the intersecting pages of every current alias
+/// so overlapping host shadows all see the same write, including aliases
+/// whose virtual pages stayed read-only throughout.
+pub fn section_output_changed(aliases: &[(usize, usize)]) {
+    if aliases.is_empty() {
+        return;
+    }
+    let mut j = JOURNAL.lock().unwrap_or_else(|e| e.into_inner());
+    j.asked += 1;
+    let now = j.asked;
+    for &(start, end) in aliases {
+        if start < end {
+            for page in start / PAGE..end.div_ceil(PAGE) {
+                j.written.insert(page, now);
+            }
+        }
+    }
+}
+
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
@@ -119,16 +162,76 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
     GUARDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Determines MEM_MAPPED afresh. Only the allocation type is needed, so
+/// avoid asking VirtualQuery to find the last equally protected page in
+/// a potentially very large allocation.
+fn is_view(start: usize) -> bool {
+    use std::ffi::c_void;
+    use std::sync::OnceLock;
+    use windows_sys::Win32::System::{
+        LibraryLoader::{GetModuleHandleA, GetProcAddress},
+        Memory::{
+            MEM_MAPPED, MEMORY_BASIC_INFORMATION, MemoryRegionInfo, VirtualQuery,
+            WIN32_MEMORY_REGION_INFORMATION,
+        },
+        Threading::GetCurrentProcess,
+    };
+    type Query = unsafe extern "system" fn(
+        *mut c_void, *const c_void, i32, *mut c_void, usize, *mut usize,
+    ) -> i32;
+    static QUERY: OnceLock<Option<Query>> = OnceLock::new();
+    let query = QUERY.get_or_init(|| {
+        // SAFETY: the permanent system module exports this exact documented
+        // signature on supported Windows versions. Other hosts can omit it.
+        unsafe {
+            let module = GetModuleHandleA(c"kernelbase.dll".as_ptr().cast());
+            if module.is_null() {
+                return None;
+            }
+            GetProcAddress(module, c"QueryVirtualMemoryInformation".as_ptr().cast()).map(|proc| {
+                std::mem::transmute::<unsafe extern "system" fn() -> isize, Query>(proc)
+            })
+        }
+    });
+    if let Some(query) = query {
+        let mut region = WIN32_MEMORY_REGION_INFORMATION::default();
+        // SAFETY: an OS query on our process; region is a valid output buffer.
+        let found = unsafe {
+            query(
+                GetCurrentProcess(), start as _, MemoryRegionInfo, (&raw mut region).cast(),
+                size_of_val(&region), std::ptr::null_mut(),
+            )
+        };
+        if found != 0 {
+            // These three bit fields are the SDK's explicit equivalents of
+            // MEM_MAPPED. Let the original query decide every other case.
+            const MAPPED_DATA_FILE: u32 = 1 << 1;
+            const MAPPED_PAGE_FILE: u32 = 1 << 3;
+            const MAPPED_PHYSICAL: u32 = 1 << 4;
+            // SAFETY: successful MemoryRegionInfo query populated the bit fields.
+            let bits = unsafe { region.Anonymous.Anonymous._bitfield };
+            if matches!(bits, MAPPED_DATA_FILE | MAPPED_PAGE_FILE | MAPPED_PHYSICAL) {
+                return true;
+            }
+        }
+    }
+    let mut info = MEMORY_BASIC_INFORMATION::default();
+    // SAFETY: an address in our process and a valid output buffer.
+    unsafe {
+        VirtualQuery(start as _, &mut info, size_of_val(&info)) != 0 && info.Type == MEM_MAPPED
+    }
+}
+
 /// For view memory: the pages of `[start, end)`'s blocks written since
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
-    use windows_sys::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQuery};
-    // SAFETY: plain data filled in by the query.
-    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
-    if n == 0 || info.Type != MEM_MAPPED {
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
+    let view = is_view(start);
+    #[cfg(feature = "diagnostics")]
+    crate::copystat::add(crate::copystat::C::GuardTypeNs, began.elapsed().as_nanos() as u64);
+    if !view {
         return None;
     }
     install();
@@ -290,6 +393,62 @@ mod tests {
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
     #[test]
+    fn mapped_type_follows_the_current_allocation_at_the_same_address() {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Foundation::CloseHandle,
+            System::Memory::{
+                CreateFileMappingW, FILE_MAP_WRITE, MEM_MAPPED, MEMORY_BASIC_INFORMATION,
+                MapViewOfFile, UnmapViewOfFile, VirtualQuery,
+            },
+        };
+        let compare = |at: usize, mapped: bool| {
+            let mut info = MEMORY_BASIC_INFORMATION::default();
+            // SAFETY: a plain query of our process.
+            assert_ne!(unsafe { VirtualQuery(at as _, &mut info, size_of_val(&info)) }, 0);
+            assert_eq!(info.Type == MEM_MAPPED, mapped);
+            assert_eq!(is_view(at), mapped);
+        };
+        // SAFETY: our section, mapping and private allocation. The map is
+        // released first, then a private allocation is placed at its address.
+        unsafe {
+            let section = CreateFileMappingW(
+                -1isize as _, std::ptr::null(), PAGE_READWRITE, 0, BLOCK as u32, std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK);
+            assert!(!view.Value.is_null());
+            compare(view.Value as usize + 399, true);
+            assert_ne!(UnmapViewOfFile(view), 0);
+            assert_ne!(CloseHandle(section), 0);
+            let mut private = VirtualAlloc(view.Value, BLOCK, MEM_RESERVE, PAGE_READWRITE);
+            if private.is_null() {
+                // An unrelated parallel test can reserve the released address.
+                private = VirtualAlloc(std::ptr::null(), BLOCK, MEM_RESERVE, PAGE_READWRITE);
+            }
+            assert!(!private.is_null());
+            compare(private as usize + 707, false);
+            assert_eq!(VirtualAlloc(private, BLOCK, MEM_COMMIT, PAGE_READWRITE), private);
+            compare(private as usize + 981, false);
+            assert_ne!(VirtualFree(private, 0, MEM_RELEASE), 0);
+            // Data-file mappings have a different allocation-type bit from
+            // page-file-backed mappings but the same MEM_MAPPED basic type.
+            let file = tempfile::tempfile().expect("temporary file");
+            file.set_len(BLOCK as u64).unwrap();
+            let section = CreateFileMappingW(
+                file.as_raw_handle(), std::ptr::null(), PAGE_READWRITE, 0, 0, std::ptr::null(),
+            );
+            assert!(!section.is_null());
+            let view = MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, BLOCK);
+            assert!(!view.Value.is_null());
+            compare(view.Value as usize + 4095, true);
+            assert_ne!(UnmapViewOfFile(view), 0);
+            assert_ne!(CloseHandle(section), 0);
+        }
+        compare(is_view as *const () as usize, false); // executable image.
+    }
+
+    #[test]
     fn written_pages_are_reported_to_every_asker() {
         // SAFETY: a fresh write-watched allocation, freed at the end.
         let p = unsafe {
@@ -312,6 +471,12 @@ mod tests {
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
         assert_eq!(again, [(p / PAGE + 1, now)]);
+        section_output_changed(&[(p + 8, p + 24), (p + 3 * PAGE + 16, p + 3 * PAGE + 48)]);
+        let (_, published) = writes(start, end, false).expect("watched");
+        let stamp = published[0].1;
+        assert!(stamp > later);
+        assert_eq!(published, [(p / PAGE, stamp), (p / PAGE + 1, now), (p / PAGE + 3, stamp)]);
+        assert_eq!(writes(p, p + PAGE, false).unwrap().1, [(p / PAGE, stamp)]);
         let mut plain = vec![0u8; PAGE];
         assert!(
             writes(

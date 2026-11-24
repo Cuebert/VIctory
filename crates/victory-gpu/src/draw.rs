@@ -11,6 +11,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use victory_shader::{ResourceType, RootType, UsedResource};
+#[path = "triangle_inputs.rs"]
+pub(crate) mod triangle_inputs;
+#[cfg(feature="diagnostics")]
+#[path="init_headers_source.rs"]
+pub(crate) mod init_headers_source;
 
 use crate::descriptor::View;
 use windows::Win32::Foundation::RECT;
@@ -22,6 +27,9 @@ use windows::core::Interface;
 use crate::host::HostList;
 use crate::object::This;
 use crate::pipeline::host::HostPipeline;
+#[cfg(feature="diagnostics")]
+#[path="material_records.rs"]
+pub(crate) mod materials;
 
 /// A root argument as the title set it.
 #[derive(Debug, Clone, Default)]
@@ -51,9 +59,60 @@ pub(crate) struct IndexView {
     format: u32,
 }
 
+#[cfg(feature = "diagnostics")]
+#[derive(Clone, Copy)]
+struct IndirectTrace {
+    signature: usize,
+    args: (usize, u64),
+    counter: (usize, u64),
+    command: (u32, u32, u32),
+    topology: u32,
+    host: usize,
+    slots: u32,
+    reason: &'static str,
+}
+
+#[cfg(feature = "diagnostics")]
+impl std::fmt::Display for IndirectTrace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (kind, stride, max) = self.command;
+        let (arg, offset) = self.args;
+        let (cnt, cnt_offset) = self.counter;
+        write!(f, " indirect(kind={kind} stride={stride} max={max} sig={:#x} args={arg:#x}+{offset:#x} count={cnt:#x}+{cnt_offset:#x} topology={} host={:#x} vertex_slots={:#x} result={})",
+            self.signature, self.topology, self.host, self.slots, self.reason)
+    }
+}
+
+/// The bytes of a root UAV the host brings up to date, lets the shaders
+/// write and copies back: a root view has no size of its own.
+const ROOT_UAV_BYTES: u64 = 1 << 20;
+
+#[cfg(feature = "diagnostics")]
+fn builder_range_evidence(frame: u64, shader: &str, slot: u8, address: u64) {
+    use std::collections::HashSet;
+    use std::sync::{LazyLock, Mutex};
+    type Seen = (u64, HashSet<(u64,u8,u64)>);
+    static SEEN: LazyLock<Mutex<Seen>> = LazyLock::new(|| Mutex::new((0,HashSet::new())));
+    let Ok(hash) = u64::from_str_radix(shader,16) else { return };
+    let mut seen = SEEN.lock().unwrap_or_else(|e|e.into_inner());
+    if frame > seen.0 {
+        seen.0 = frame;
+        seen.1.clear();
+    }
+    if frame != seen.0 || seen.1.len() >= 48
+        || seen.1.iter().filter(|(h,s,_)|*h==hash && *s==slot).count() >= 4
+        || !seen.1.insert((hash,slot,address)) { return }
+    drop(seen);
+    let first_word = crate::shadow::range_evidence(address,4);
+    let first_block = crate::shadow::range_evidence(address,64);
+    tracing::info!(frame, shader, slot, %first_word, %first_block, "builder root UAV provenance");
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
+    #[cfg(feature="diagnostics")]
+    as_join_roots: Vec<(crate::as_join::Probe,u64,u8,bool)>,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -63,6 +122,18 @@ pub(crate) struct State {
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
+    #[cfg(feature = "diagnostics")]
+    title_rtvs: [usize; 8],
+    #[cfg(feature="diagnostics")]
+    pending_material: Option<materials::Pending>,
+    #[cfg(feature = "diagnostics")]
+    light_tiles: Vec<crate::capture::light_tiles::View>,
+    #[cfg(feature = "diagnostics")]
+    light_constants: std::collections::HashMap<(u64,u32), (u64,u32)>,
+    #[cfg(feature = "diagnostics")]
+    bound_light_constants: [Option<(u64,u32)>;2],
+    #[cfg(feature = "diagnostics")]
+    indirect_trace: Option<IndirectTrace>,
     depth: usize,
     /// None leaves the host list's default bounds (0..1) in place.
     depth_bounds: Option<(f32, f32)>,
@@ -73,7 +144,16 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    /// Tables made afresh in this list: (table, what it holds) → first
+    /// Explicit writes of slot 2 dwords 1 and 2; gaps in root constants
+    /// carry undefined data and cannot authorize a section output.
+    counter_constants: u8,
+    counter_root: bool,
+    /// Aligned private UAV scratch reused by successive full-overwrite Resets on this list.
+    counter_scratch: Option<(u64, ID3D12Resource)>,
+    triangle_constants: u16,
+    triangle_views: u8,
+    compute_signature: usize,
+    /// Tables made afresh in this list: (table, what it holds) Ã¢â€ â€™ first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u64), u32>,
     /// The dynamic slots the list holds: title heap, first, count; given
@@ -82,8 +162,14 @@ pub(crate) struct State {
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
     /// Root SRVs bound as one-view tables in this list: (host heap, title
-    /// address) → dynamic slot.
+    /// address) Ã¢â€ â€™ dynamic slot.
     root_srv_slots: std::collections::HashMap<(usize, u64), u32>,
+    /// Latest map for each heap, with its registered allocation generation.
+    maps: Vec<(usize, u64, u64, crate::address_map::MapTotals)>,
+    map_slots: Vec<crate::descriptor::host::MapSlots>,
+    word_resources: std::collections::HashSet<usize>,
+    /// Root UAV slots are keyed by heap, title address, owned copy and extent.
+    root_uav_slots: std::collections::HashMap<(usize, u64, usize, u64), u32>,
 }
 
 impl Drop for State {
@@ -220,14 +306,60 @@ impl State {
     }
 
     pub(crate) fn set_table(&mut self, compute: bool, slot: u32, handle: u64) {
+        if compute && slot < 8 {
+            self.triangle_views &= !(1u8 << slot);
+        }
+        if compute && slot == 8 {
+            self.triangle_constants = 0;
+        }
+        if compute && slot == 1 {
+            self.counter_root = false;
+        }
+        if compute && slot == 2 {
+            self.counter_constants = 0;
+        }
         set(self.roots(compute), slot, Root::Table(handle));
     }
 
     pub(crate) fn set_view(&mut self, compute: bool, slot: u32, address: u64) {
+        if compute && slot < 8 {
+            self.triangle_views &= !(1u8 << slot);
+            if address != 0 {
+                self.triangle_views |= 1u8 << slot;
+            }
+        }
+        if compute && slot == 8 {
+            self.triangle_constants = 0;
+        }
+        if compute && slot == 1 {
+            self.counter_root = address != 0;
+        }
+        if compute && slot == 2 {
+            self.counter_constants = 0;
+        }
         set(self.roots(compute), slot, Root::View(address));
     }
 
     pub(crate) fn set_constants(&mut self, compute: bool, slot: u32, values: &[u32], offset: u32) {
+        if compute && slot < 8 {
+            self.triangle_views &= !(1u8 << slot);
+        }
+        if compute && slot == 8 && offset < 14 {
+            let n = values.len().min((14 - offset) as usize);
+            self.triangle_constants |= (((1u16 << n) - 1) << offset) as u16;
+        }
+        if compute && slot == 1 {
+            self.counter_root = false;
+        }
+        if compute && slot == 2 {
+            for i in [1u32, 2] {
+                if i.checked_sub(offset)
+                    .is_some_and(|j| (j as usize) < values.len())
+                {
+                    self.counter_constants |= 1 << i;
+                }
+            }
+        }
         let roots = self.roots(compute);
         let s = slot as usize;
         if !matches!(roots.get(s), Some(Root::Constants(_))) {
@@ -239,6 +371,16 @@ impl State {
                 c.resize(end, 0);
             }
             c[offset as usize..end].copy_from_slice(values);
+        }
+    }
+
+    pub(crate) fn set_compute_signature(&mut self, signature: usize) {
+        if self.compute_signature != signature {
+            self.compute_signature = signature;
+            self.counter_root = false;
+            self.counter_constants = 0;
+            self.triangle_constants = 0;
+            self.triangle_views = 0;
         }
     }
 
@@ -260,8 +402,10 @@ impl State {
             return;
         };
         self.targets.clear();
+        #[cfg(feature = "diagnostics")]
+        self.title_rtvs.fill(0);
         let mut rtvs = Vec::new();
-        for &h in handles {
+        for (_slot, &h) in handles.iter().enumerate() {
             let Some(record) = crate::descriptor::rtv_record(h) else {
                 once!(
                     handle = format_args!("{h:#x}"),
@@ -269,7 +413,14 @@ impl State {
                 );
                 continue;
             };
+            #[cfg(feature = "diagnostics")]
+            if let Some(slot) = self.title_rtvs.get_mut(_slot) { *slot = record.resource as usize; }
             let Some(texture) = crate::resource::host_resource(record.resource) else {
+                #[cfg(feature = "diagnostics")]
+                if crate::capture::dump_on() && crate::capture::listed(crate::queue::presented() + 1) {
+                    tracing::info!(frame = crate::queue::presented() + 1, resource = ?record.resource,
+                        handle = format_args!("{h:#x}"), "title RTV has no host texture");
+                }
                 continue;
             };
             self.targets.push(record.resource as usize);
@@ -365,6 +516,21 @@ impl State {
         }
     }
 
+    #[inline]
+    fn reject(&mut self, _reason: &'static str) -> bool {
+        #[cfg(feature = "diagnostics")]
+        if let Some(t) = &mut self.indirect_trace { t.reason = _reason; }
+        false
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn indirect_pso(&mut self, p: &HostPipeline) {
+        if let Some(t) = &mut self.indirect_trace {
+            t.host = p.pso.as_raw() as usize;
+            t.slots = p.slots;
+        }
+    }
+
     /// Brings the host list up to date for a draw; false if the draw cannot
     /// run on the host.
     fn prepare(&mut self, list: &HostList, indexed: bool) -> bool {
@@ -375,14 +541,16 @@ impl State {
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            return false;
+            return self.reject("diagnostic-skip");
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            return false;
+            return self.reject("no-host-pso");
         };
+        #[cfg(feature = "diagnostics")]
+        self.indirect_pso(p);
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
-            return false;
+            return self.reject("pso-type");
         }
         if !self.bind(list, p, false) {
             return false;
@@ -420,7 +588,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find(v.address, u64::from(v.size)) else {
-                return false;
+                return self.reject("index-buffer");
             };
             shadow.refresh(list, v.address, u64::from(v.size));
             list.buffer_state(&shadow.buffer, crate::host::BUFFER_READ);
@@ -451,6 +619,25 @@ impl State {
     /// False if the draw or dispatch must not run: a table it reads could
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        if compute && p.stages.iter().any(|s| s.shader.exact_triangle_builder) {
+            return self.reject("triangle-indirect-arguments-unverified");
+        }
+        self.bind_with_reset(list, p, compute, None)
+    }
+
+    fn bind_with_reset(
+        &mut self,
+        list: &HostList,
+        p: &HostPipeline,
+        compute: bool,
+        reset: Option<&crate::section_reset::Output>,
+    ) -> bool {
+        #[cfg(feature = "diagnostics")]
+        {
+            self.pending_material = None;
+            self.light_tiles.clear();
+            self.bound_light_constants = [None;2];
+        }
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -499,6 +686,41 @@ impl State {
             let t = stage.translated();
             self.table_failed = false;
             let made = self.tables(list, &t.used, compute);
+            #[cfg(feature = "diagnostics")]
+            if stage.shader.hash == crate::capture::light_tiles::HASH && crate::capture::trace_window(crate::queue::presented()+1)
+                && let Some((_,start))=made.iter().find(|(slot,_)| *slot==0)
+                && let Some(Root::Table(base))=self.roots_ref(compute).first() {
+                self.bound_light_constants=[1416u32,1424].map(|offset| self.light_constants.get(&(*base,start/32+offset/8)).copied());
+            }
+            #[cfg(feature = "diagnostics")]
+            if crate::capture::dump_on() && crate::capture::listed(crate::queue::presented() + 1) {
+                for u in t.used.iter().filter(|u| u.root == RootType::Table && matches!(u.kind, ResourceType::Srv | ResourceType::Uav)) {
+                    let Some((heap, base, handle, title_index)) = self.trace_table(compute, u) else { continue };
+                    let Some(view) = crate::descriptor::view(handle) else {continue};
+                    let (View::Shader(r, _) | View::Unordered(r, ..)) = &view else { continue };
+                    let r = *r;
+                    let Some(expected) = crate::resource::host_resource(r as This) else { continue };
+                    let host_index = made.iter().find(|(slot, _)| *slot == u.slot)
+                        .map_or(title_index, |(_, offset)| offset / 32 + ((handle - base) / 32) as u32);
+                    let actual = heap.host().and_then(|host| host.trace_texture(host_index));
+                    let expected = expected.as_raw() as usize;
+                    if let Some(stage)=crate::capture::light_tiles::Stage::for_binding(&stage.shader.hash,u.slot,u.table_offset_dwords) {
+                        let desc=match (stage.writes(),view){
+                            (false,View::Shader(_,desc))=>Some(desc),
+                            (true,View::Unordered(_,_,desc))=>Some(desc),
+                            _=>None,
+                        };
+                        if let Some(desc)=desc {self.light_tiles.push(crate::capture::light_tiles::View {
+                            stage,resource: r, desc, host_index, mirrored: actual == Some(expected),
+                        });}
+                    }
+                    if actual != Some(expected) {
+                        tracing::info!(frame = crate::queue::presented() + 1, shader = %stage.shader.hash,
+                            slot = u.slot, offset = u.table_offset_dwords, host_index, resource = format_args!("{r:#x}"),
+                            expected = format_args!("{expected:#x}"), actual = ?actual, "texture descriptor mismatch while recording");
+                    }
+                }
+            }
             if self.table_failed {
                 static DROPPED_TABLES: AtomicU64 = AtomicU64::new(0);
                 let n = DROPPED_TABLES.fetch_add(1, Ordering::Relaxed) + 1;
@@ -508,7 +730,7 @@ impl State {
                         "a draw or dispatch dropped: no dynamic slots for its tables"
                     );
                 }
-                return false;
+                return self.reject("dynamic-table-full");
             }
             if let Some((param, dwords)) = stage.user_data {
                 let mut values = vec![0u32; dwords as usize];
@@ -530,6 +752,139 @@ impl State {
                     }
                 }
             }
+            // Resolve retained root UAVs before this stage snapshots its address map.
+            for &(slot, param) in &stage.root_uavs {
+                let address = match self.roots_ref(compute).get(usize::from(slot)) {
+                    Some(&Root::View(address)) => Some(address),
+                    _ => {
+                        once!(slot, "a shader writes a root view the title did not set");
+                        None
+                    }
+                };
+                let mut kinds = stage
+                    .translated()
+                    .used
+                    .iter()
+                    .filter(|u| u.root == RootType::Descriptor && u.slot == slot)
+                    .map(|u| u.kind);
+                let Some(kind) = kinds.next() else {
+                    return self.reject("root-view-unknown-access");
+                };
+                if kinds.any(|k| k != kind) {
+                    return self.reject("root-view-ambiguous-access");
+                }
+                let write = match kind {
+                    victory_shader::ResourceType::Uav => true,
+                    victory_shader::ResourceType::Srv => false,
+                    _ => return self.reject("root-view-unknown-access"),
+                };
+                let bound = if let Some(output) = reset.filter(|_| slot == 1) {
+                    Ok(output.bind(list, param))
+                } else {
+                    self.root_uav_table(list, address, param, compute, write)
+                };
+                #[cfg(feature="diagnostics")]
+                if compute && write && reset.is_none() && self.as_join_roots.len()<8 && crate::capture::trace_window(crate::queue::presented()+1)
+                    && matches!(stage.shader.hash.as_str(),"3b90165a77d95cdf"|"4ddd6f9702fab2a7"|"caa78b8ca62bc3d6"|"28918b7150a7aad5"|"6f6a359d1166bb27"|"5552dac6a2b7a1fd"|"f6e47efa50226beb")
+                    && let (Some(a),Ok(hash))=(address,u64::from_str_radix(&stage.shader.hash,16)) {
+                    self.as_join_roots.push((crate::as_join::Probe::new(a,bound.unwrap_or(64)),hash,slot,bound.is_ok()));
+                }
+                #[cfg(feature = "diagnostics")]
+                if matches!(
+                    stage.shader.hash.as_str(),
+                    "3b90165a77d95cdf"
+                        | "4ddd6f9702fab2a7"
+                        | "caa78b8ca62bc3d6"
+                        | "28918b7150a7aad5"
+                        | "6f6a359d1166bb27"
+                        | "5552dac6a2b7a1fd"
+                        | "f6e47efa50226beb"
+                ) && crate::capture::trace_window(crate::queue::presented() + 1)
+                {
+                    let shader = stage.shader.clone();
+                    list.defer_host(move || {
+                        let frame = crate::queue::presented() + 1;
+                        if crate::capture::listed(frame) {
+                            tracing::info!(frame, hash=%shader.hash, root_slot=slot, extent=?bound,
+                                "builder root UAV at submitted list");
+                            if bound.is_err() && let Some(a) = address {
+                                builder_range_evidence(frame,&shader.hash,slot,a);
+                            }
+                        }
+                    });
+                }
+                if let Err(reason) = bound {
+                    return self.reject(reason);
+                }
+            }
+            // The address map and the descriptor words belong to the view
+            // heap: without them the shader would read nothing it expects.
+            let heap = (self.heaps[0] != 0)
+                .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+                .flatten();
+            let mut extra = Vec::new();
+            #[cfg(feature = "diagnostics")]
+            let mut laser_totals=None;
+            if let Some(param) = stage.address_map {
+                let Some(h) = heap else {
+                    #[cfg(feature = "diagnostics")]
+                    crate::address_map::trace_laser(list,&stage.shader.hash,"missing view heap",None);
+                    return false;
+                };
+                let native_id = h.heap.as_raw() as usize;
+                let generation = crate::shadow::map_generation();
+                let made = self
+                    .maps
+                    .iter()
+                    .find(|m| m.0 == native_id && m.1 == generation)
+                    .map(|m| (m.2,m.3));
+                let gpu = match made {
+                    Some(gpu) => Some(gpu),
+                    None => {
+                        crate::address_map::make(list, h).map(|(generation, gpu, slots,totals)| {
+                            if let Some(slots) = slots {
+                                self.map_slots.push(slots);
+                            }
+                            self.maps.retain(|m| m.0 != native_id);
+                            self.maps.push((native_id, generation, gpu,totals));
+                            (gpu,totals)
+                        })
+                    }
+                };
+                let Some((gpu,_totals)) = gpu else {
+                    #[cfg(feature = "diagnostics")]
+                    crate::address_map::trace_laser(list,&stage.shader.hash,"map unavailable",None);
+                    once!("a draw or dispatch dropped: no address map for its view heap");
+                    return false;
+                };
+                #[cfg(feature = "diagnostics")]
+                {laser_totals=Some(_totals);}
+                extra.push((param, gpu));
+            }
+            if let Some(param) = stage.descriptor_words {
+                let Some((resource, gpu)) = heap.and_then(|h| h.words()) else {
+                    #[cfg(feature = "diagnostics")]
+                    crate::address_map::trace_laser(list,&stage.shader.hash,"missing descriptor words",laser_totals);
+                    once!("a draw or dispatch dropped: no descriptor words for its view heap");
+                    return false;
+                };
+                if self.word_resources.insert(resource.as_raw() as usize) {
+                    list.keep(resource);
+                }
+                extra.push((param, gpu));
+            }
+            for (param, gpu) in extra {
+                // SAFETY: an open list; the buffers live as long as it runs.
+                unsafe {
+                    if compute {
+                        l.SetComputeRootShaderResourceView(param, gpu);
+                    } else {
+                        l.SetGraphicsRootShaderResourceView(param, gpu);
+                    }
+                }
+            }
+            #[cfg(feature = "diagnostics")]
+            crate::address_map::trace_laser(list,&stage.shader.hash,if stage.address_map.is_some() {"map bound"}else{"stage did not request map"},laser_totals);
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
                 for &(slot, param) in views {
                     let tabled = srv && crate::pipeline::host::bounded_root_srvs();
@@ -563,7 +918,76 @@ impl State {
                 }
             }
         }
+        #[cfg(feature="diagnostics")]
+        if !compute && let Some(stage)=p.stages.iter().find(|s|s.shader.stage=="pixel") {
+            self.pending_material=materials::prepare(self,list,&stage.shader,stage.translated());
+        }
         true
+    }
+
+    /// Bind a raw UAV of the registered title allocation, retained until retirement.
+    /// Reused addresses or shorter ranges receive separate descriptor slots.
+    fn root_uav_table(
+        &mut self,
+        list: &HostList,
+        address: Option<u64>,
+        param: u32,
+        compute: bool,
+        write: bool,
+    ) -> Result<u64, &'static str> {
+        let Some((heap, host)) = self
+            .heaps
+            .iter()
+            .filter(|&&h| h != 0)
+            .map(|&h| crate::descriptor::heap(h as This))
+            .find_map(|h| h.host().filter(|x| !x.is_sampler()).map(|x| (h, x)))
+        else {
+            once!("a root UAV without a bound view heap: the draw is dropped");
+            return Err("root-uav-missing-view-heap");
+        };
+        let Some(a) = address else {
+            return Err("root-uav-missing");
+        };
+        let Some((s, len)) = crate::shadow::owned_root_view(a, ROOT_UAV_BYTES, write) else {
+            return Err(if write {
+                "root-uav-range"
+            } else {
+                "root-srv-range"
+            });
+        };
+        let key = (
+            std::ptr::from_ref(heap) as usize,
+            a,
+            std::sync::Arc::as_ptr(&s) as usize,
+            len,
+        );
+        let index = match self.root_uav_slots.get(&key) {
+            Some(&index) => index,
+            None => {
+                let Some(index) = host.dynamic(1) else {
+                    return Err("root-uav-slots-full");
+                };
+                self.dynamic.push((key.0, index, 1));
+                self.root_uav_slots.insert(key, index);
+                host.raw_uav_at(index, &s.buffer, s.offset(a) / 4, (len / 4) as u32);
+                index
+            }
+        };
+        s.refresh(list, a, len);
+        if write {
+            s.gpu_writes(list, a, len);
+        }
+        list.buffer_state(&s.buffer, crate::host::BUFFER_WRITE);
+        let handle = host.gpu_handle(index);
+        // SAFETY: an open list; the slot is in the bound view heap.
+        unsafe {
+            if compute {
+                list.list.SetComputeRootDescriptorTable(param, handle);
+            } else {
+                list.list.SetGraphicsRootDescriptorTable(param, handle);
+            }
+        }
+        Ok(len)
     }
 
     /// Binds a root SRV as a one-view table (see
@@ -586,7 +1010,7 @@ impl State {
             .find_map(|h| h.host().filter(|x| !x.is_sampler()).map(|x| (h, x)))
         else {
             once!("a root SRV without a bound view heap: the draw is dropped");
-            return false;
+            return self.reject("root-srv-no-heap");
         };
         let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
@@ -594,7 +1018,7 @@ impl State {
             Some(&index) => index,
             None => {
                 let Some(index) = host.dynamic(1) else {
-                    return false;
+                    return self.reject("root-srv-slots-full");
                 };
                 self.dynamic.push((key.0, index, 1));
                 self.root_srv_slots.insert(key, index);
@@ -637,13 +1061,39 @@ impl State {
         true
     }
 
+    #[cfg(feature="diagnostics")]
+    pub(crate) fn trace_init_headers_source(&self, list: &HostList, groups: [u32; 3],
+        upload: impl FnOnce(usize, usize) -> Option<std::sync::Arc<crate::list::CommandUpload>>) {
+        if triangle_inputs::enabled() && crate::capture::trace_window(crate::queue::presented()+1) {
+            if crate::pipeline::contains_shader(self.pipeline as This,0x3cea4534bbc15632) {
+                let source=match self.compute.first(){Some(Root::View(a))=>*a,_=>0};
+                let count=match self.compute.get(2){Some(Root::Constants(c))=>c.first().copied(),_=>None};
+                init_headers_source::record(list,source,count,groups,upload);
+            }
+        }
+    }
+
     /// Runs a dispatch on the host.
     pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
+        #[cfg(feature="diagnostics")]
+        self.as_join_roots.clear();
+        let ran = self.record_dispatch(list, x, y, z);
+        #[cfg(feature="diagnostics")]
+        for (target,shader,slot,bound) in self.as_join_roots.drain(..) {
+            list.as_join_event(crate::as_join::Event::Builder{target,shader,slot,issued:ran && bound && x!=0 && y!=0 && z!=0});
+        }
+        #[cfg(feature = "diagnostics")]
+        self.trace_work(list, "dispatch", true, ran);
+        #[cfg(not(feature = "diagnostics"))]
+        let _ = ran;
+    }
+
+    fn record_dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             crate::pipeline::note_drop(self.pipeline as This);
-            return;
+            return false;
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
             once!(
@@ -653,21 +1103,141 @@ impl State {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
-            return;
+            return false;
         };
         if !p.compute {
             once!("a dispatch with a graphics pipeline");
-            return;
+            return false;
         }
-        if !self.bind(list, p, true) {
+        let mut triangle = None;
+        if p.stages.len() == 1 && p.stages[0].shader.exact_triangle_builder {
+            if !triangle_inputs::enabled() {
+                return self.reject("triangle-builder-disabled");
+            }
+            let constants: &[u32] = match self.compute.get(8) {
+                Some(Root::Constants(values)) => values,
+                _ => &[],
+            };
+            let stage = &p.stages[0];
+            let roots = [0usize, 4, 5, 6, 7].map(|slot| match self.compute.get(slot) {
+                Some(Root::View(a)) => *a,
+                _ => 0,
+            });
+            let spans = if self.triangle_views & 0xf1 == 0xf1 {
+                triangle_inputs::resolve(
+                    constants,
+                    self.triangle_constants,
+                    &stage.translated().host,
+                )
+            } else {
+                Err("triangle-root-view-missing")
+            };
+            #[cfg(feature = "diagnostics")]
+            triangle_inputs::trace(
+                list,
+                roots,
+                constants,
+                self.triangle_constants,
+                self.triangle_views,
+                spans.as_ref().err().copied(),
+            );
+            let _ = roots;
+            match spans {
+                Ok(s) => {
+                    triangle_inputs::prepare(list, &s);
+                    triangle = Some(s);
+                }
+                Err(why) => return self.reject(why),
+            }
+        }
+        let mut reset = None;
+        if crate::section_reset::enabled()
+            && p.stages.len() == 1
+            && p.stages[0].shader.exact_counter_reset()
+        {
+            if [x, y, z].contains(&0) {
+                return false;
+            }
+            let Some(Root::Constants(constants)) = self.compute.get(2) else {
+                return self.reject("reset-missing-constants");
+            };
+            if self.counter_constants != 6 {
+                return self.reject("reset-missing-constants");
+            }
+            let Some(bytes) = crate::section_reset::footprint([x, y, z], constants[1]) else {
+                return self.reject("reset-invalid-dimensions");
+            };
+            if bytes == 0 {
+                return false;
+            }
+            if !self.counter_root {
+                return self.reject("root-uav-missing");
+            }
+            let Some(&Root::View(address)) = self.compute.get(1) else {
+                return self.reject("root-uav-missing");
+            };
+            if let Some((_, extent)) = crate::shadow::owned_uav(address, ROOT_UAV_BYTES) {
+                if bytes as u64 > extent {
+                    return self.reject("reset-owned-range");
+                }
+            } else {
+                let Some(heap) = (self.heaps[0] != 0)
+                    .then(|| crate::descriptor::heap(self.heaps[0] as This).host())
+                    .flatten()
+                else {
+                    return self.reject("root-uav-missing-view-heap");
+                };
+                if !matches!(p.stages[0].root_uavs.as_slice(), [(1, _)]) {
+                    return self.reject("reset-root-layout");
+                }
+                let Some(output) = crate::section_reset::Output::prepare(address, bytes, heap, &mut self.counter_scratch)
+                else {
+                    #[cfg(feature = "diagnostics")]
+                    {
+                        if crate::capture::trace_window(crate::queue::presented()+1) {
+                            self.as_join_roots.push((crate::as_join::Probe::new(address,bytes as u64),0x3b90165a77d95cdf,1,false));
+                        }
+                        use std::sync::atomic::AtomicUsize;
+                        static REFUSED: AtomicUsize = AtomicUsize::new(0);
+                        let n = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n.is_power_of_two() {
+                            tracing::info!(
+                                n,
+                                address = format_args!("{address:#x}"),
+                                groups = x,
+                                count = constants[1],
+                                bytes,
+                                "counter reset section footprint unavailable"
+                            );
+                        }
+                    }
+                    DROPPED.fetch_add(1, Ordering::Relaxed);
+                    #[cfg(feature = "diagnostics")]
+                    crate::pipeline::note_drop(self.pipeline as This);
+                    return self.reject("reset-section-range");
+                };
+                reset = Some(output);
+            }
+        }
+        if !self.bind_with_reset(list, p, true, reset.as_ref()) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
-            return;
+            return false;
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
+        let uses_root_uav = p.stages.iter().any(|s| !s.root_uavs.is_empty());
+        order_root_uav_writes(list, uses_root_uav);
         unsafe { list.list.Dispatch(x, y, z) };
+        order_root_uav_writes(list, uses_root_uav);
+        if let Some(output) = reset {
+            output.record(list);
+        }
+        if let Some(spans) = triangle {
+            triangle_inputs::issued(list, spans);
+        }
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        true
     }
 
     /// What a draw or dispatch runs, for the device-removed report
@@ -717,8 +1287,17 @@ impl State {
                 Ok(l6) => {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
+                    #[cfg(feature = "diagnostics")]
+                    let stats = list.begin_mesh_stats(self.pipeline as This, "mesh");
+                    #[cfg(feature="diagnostics")]
+                    if let Some(slot)=stats {
+                        tracing::info!(frame=crate::queue::presented()+1,slot,list=format_args!("{:p}",list.list.as_raw()),groups=x,
+                            rtvs=?self.title_rtvs,depth=self.depth,depth_bounds=?self.depth_bounds,"direct mesh sampled attachments");
+                    }
                     // SAFETY: an open list with everything set.
                     unsafe { l6.DispatchMesh(x, 1, 1) };
+                    #[cfg(feature = "diagnostics")]
+                    list.end_draw_stats(stats);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
                 }
@@ -729,6 +1308,8 @@ impl State {
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+        #[cfg(feature = "diagnostics")]
+        self.trace_work(list, "mesh", false, ran);
     }
 
     fn roots_ref(&self, compute: bool) -> &Vec<Root> {
@@ -737,6 +1318,178 @@ impl State {
         } else {
             &self.graphics
         }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn trace_table(&self, compute: bool, u: &UsedResource) -> Option<(&crate::descriptor::Heap, u64, u64, u32)> {
+        let Root::Table(base) = self.roots_ref(compute).get(usize::from(u.slot))? else { return None };
+        let heap = self.heap_of(*base)?;
+        let handle = base.checked_add(u64::from(u.table_offset_dwords) * 4)?;
+        let index = heap.index(handle)?;
+        // The view is encoded in the first 12 bytes of an aligned 32-byte slot.
+        if (handle - heap.start) % 32 != 0 || heap.index(handle.checked_add(11)?) != Some(index) {
+            return None;
+        }
+        Some((heap, *base, handle, index))
+    }
+
+    /// Record the title's bindings even if its pipeline could not be made.
+    /// A line is emitted when this list is actually submitted. Resource IDs
+    /// match the target PNG names and the PresentX inventory.
+    #[cfg(feature = "diagnostics")]
+    fn trace_work(&self, list: &HostList, op: &'static str, compute: bool, recorded_on_host: bool) {
+        use std::fmt::Write;
+        if recorded_on_host && let Some(pass) = crate::capture::preview_pass()
+            && crate::pipeline::contains_shader(self.pipeline as This, pass.hash) {
+            let resource = match pass.output {
+                crate::capture::OutputBinding::Rtv(slot) if !compute => self.title_rtvs.get(slot).copied(),
+                crate::capture::OutputBinding::Uav(slot, offset) => {
+                    crate::pipeline::trace_bindings(self.pipeline as This)
+                        .filter(|(s,_)| u64::from_str_radix(&s.hash, 16) == Ok(pass.hash))
+                        .filter_map(|(_, uses)| uses).flatten()
+                        .find(|u| u.kind == ResourceType::Uav && u.root == RootType::Table && u.slot == slot && u.table_offset_dwords == offset)
+                        .and_then(|u| self.trace_table(compute,u))
+                        .and_then(|(_,_,handle,_)| crate::descriptor::view(handle))
+                        .and_then(|v| match v { View::Unordered(id,..) => Some(id), _ => None })
+                }
+                _ => None
+            };
+            if let Some(id) = resource && let Some(copy) = crate::resource::host_copy(id as This) {
+                list.defer_host(move || crate::capture::note_pass_target(pass, id, &copy));
+            }
+        }
+        let recording_frame = crate::queue::presented() + 1;
+        if !crate::capture::dump_on() { return; }
+        let indirect = self.indirect_trace;
+        if recorded_on_host && !self.light_tiles.is_empty() {
+            if !compute {crate::capture::light_tiles::uniforms(list, self.bound_light_constants, recording_frame);}
+            for &view in &self.light_tiles {crate::capture::light_tiles::record(list, view, recording_frame);}
+        }
+        if recorded_on_host && !compute && let Some(material)=&self.pending_material {
+            material.record(list,recording_frame);
+        }
+        if recorded_on_host && !compute
+            && let Some((hash,slot))=crate::capture::rtv_sample::selected(recording_frame,self.pipeline as This)
+            && let Some(&id)=self.title_rtvs.get(slot)
+            && id!=0 && self.targets.get(slot)==Some(&id)
+            && let Some(copy)=crate::resource::host_copy(id as This)
+            && let Some(host)=crate::host::host() {
+            list.sample_target(&host.device,&copy,recording_frame,hash,slot,id);
+        }
+        if recorded_on_host {
+            for sample in crate::capture::buffer_sample::matching(self.pipeline as This, recording_frame) {
+                let range = crate::pipeline::trace_bindings(self.pipeline as This)
+                    .filter(|(s,_)| u64::from_str_radix(&s.hash,16)==Ok(sample.hash))
+                    .filter_map(|(_,u)|u).flatten()
+                    .find(|u| u.root==RootType::Table && u.kind==sample.kind && u.slot==sample.slot && u.table_offset_dwords==sample.offset)
+                    .and_then(|u| self.trace_table(compute,u))
+                    .and_then(|(_,_,handle,_)|crate::descriptor::view(handle))
+                    .and_then(|view|crate::descriptor::host::buffer_range(&view));
+                if let Some((address,len))=range {
+                    crate::capture::buffer_sample::record(list,sample,recording_frame,address,len);
+                }
+            }
+        }
+        let stages = crate::pipeline::trace_stages(self.pipeline as This);
+        if recorded_on_host {
+            use crate::capture::OutputBinding;
+            let rtvs = self.title_rtvs;
+            let uavs: Vec<_> = crate::pipeline::trace_uavs(self.pipeline as This).iter().filter_map(|u| {
+                let (_,_,handle,_) = self.trace_table(compute,u)?;
+                match crate::descriptor::view(handle)? {
+                    View::Unordered(id,..) => Some((id, Some(OutputBinding::Uav(u.slot,u.table_offset_dwords)))),
+                    _ => None,
+                }
+            }).collect();
+            let names = stages.clone();
+            if (!compute && rtvs.iter().any(|r| *r != 0)) || !uavs.is_empty() {
+                list.defer_host(move || {
+                    let render_targets = rtvs.iter().enumerate().filter(|(_,id)| !compute && **id != 0)
+                        .map(|(i,id)| (*id, Some(OutputBinding::Rtv(i))));
+                    crate::capture::remember_writes(crate::queue::presented() + 1, recording_frame, op,
+                        names.as_ref(), render_targets.chain(uavs.iter().copied()));
+                });
+            }
+        }
+        if !crate::capture::trace_window(recording_frame) && !crate::capture::watches(stages.as_deref()) {
+            // Long-lived lists can run even before a future capture is armed.
+            // Keep immutable stage identities and actual RTV slots so their
+            // texture outputs still join the capture at queue submission.
+            let attachments = self.title_rtvs;
+            let pipeline = self.pipeline;
+            list.defer_host(move || {
+                if !crate::capture::listed(crate::queue::presented() + 1) { return; }
+                let rtvs = if compute { String::new() } else {
+                    attachments.iter().enumerate().filter(|(_,r)| **r != 0)
+                        .map(|(i,r)| format!("{i}={r:#x}")).collect::<Vec<_>>().join(",")
+                };
+                let mut bindings = format!("{} [recorded outside descriptor capture window]", stages.as_deref().unwrap_or(""));
+                if let Some(t) = indirect { let _ = write!(bindings, "{t}"); }
+                crate::capture::submitted_pass(recording_frame, op, recorded_on_host, pipeline, &rtvs, &bindings, 0);
+            });
+            return;
+        }
+        let started = std::time::Instant::now();
+        let mut bindings = String::new();
+        if let Some(t) = indirect { let _ = write!(bindings, "{t}"); }
+        for (shader, uses) in crate::pipeline::trace_bindings(self.pipeline as This) {
+            let _ = write!(bindings, " | {} {}", shader.stage, shader.hash);
+            let Some(uses) = uses else {
+                bindings.push_str(" unavailable resource metadata");
+                continue;
+            };
+            for u in uses.iter().filter(|u| matches!(u.kind, ResourceType::Srv | ResourceType::Uav)) {
+                let _ = write!(bindings, " {:?} s{}+{}=", u.kind, u.slot, u.table_offset_dwords);
+                if u.root != RootType::Table {
+                    if u.root == RootType::Descriptor && let Some(Root::View(address)) = self.roots_ref(compute).get(usize::from(u.slot)) {
+                        let _ = write!(bindings, "root({address:#x})");
+                    } else {
+                        let _ = write!(bindings, "{:?}", u.root);
+                    }
+                    continue;
+                }
+                let view = self.trace_table(compute, u).and_then(|(_, _, handle, _)| crate::descriptor::view(handle));
+                let range = view.as_ref().and_then(crate::descriptor::host::buffer_range);
+                match view {
+                    Some(View::Shader(0, Some(desc))) if desc[1] == 11 => {
+                        let address = u64::from(desc[4]) | u64::from(desc[5]) << 32;
+                        let _ = write!(bindings, "acceleration_structure(dim=11,address_set={},aligned256={})",
+                            address != 0, address & 255 == 0);
+                        if recorded_on_host && shader.hash == "32ed072b9f845048"
+                            && u.slot == 1 && u.table_offset_dwords == 8 {
+                            list.as_join_event(crate::as_join::Event::Header{target:crate::as_join::Probe::new(address,64),issued:true});
+                            list.defer_host(move || {
+                                let frame = crate::queue::presented() + 1;
+                                if crate::capture::listed(frame) {
+                                    let header = crate::shadow::range_evidence(address, 64);
+                                    tracing::info!(frame, recording_frame, address_set = address != 0,
+                                        aligned256 = address & 255 == 0, high_bits_set = address >> 48 != 0,
+                                        %header, "laser acceleration-structure descriptor at submitted command");
+                                }
+                            });
+                        }
+                    }
+                    Some(View::Shader(r, _) | View::Unordered(r, ..)) => { let _ = write!(bindings, "{r:#x}"); }
+                    Some(View::Placed(unordered, desc, view)) => {
+                        let address = u64::from(view[10]) | u64::from(view[11]) << 32;
+                        let _ = write!(bindings, "placed({address:#x},dim={},format={},unordered={unordered})", desc[0], desc[8]);
+                    }
+                    Some(_) => bindings.push_str("other view kind"),
+                    None => bindings.push_str("unresolved table view"),
+                }
+                if let Some((address, length)) = range {
+                    let _ = write!(bindings, "[bytes={address:#x}+{length:#x}]");
+                }
+            }
+        }
+        let rtvs = if compute { String::new() } else {
+            self.title_rtvs.iter().enumerate().filter(|(_,r)| **r!=0).map(|(i,r)|format!("{i}={r:#x}")).collect::<Vec<_>>().join(",")
+        };
+        let pipeline = self.pipeline;
+        let record_us = started.elapsed().as_micros() as u64;
+        list.defer_host(move || {
+            crate::capture::submitted_pass(recording_frame, op, recorded_on_host, pipeline, &rtvs, &bindings, record_us);
+        });
     }
 
     fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
@@ -870,6 +1623,10 @@ impl State {
                         };
                         list.defer_fill(to, address as *const u8, size as usize);
                         host.constant_at(index, gpu, size);
+                        #[cfg(feature = "diagnostics")]
+                        if slot==0 && matches!(k,177|178) && self.light_constants.len()<512 && crate::capture::dump_on() {
+                            self.light_constants.insert((table,index),(gpu,size));
+                        }
                     }
                     Some(view) => {
                         host.make_at(index, &view);
@@ -966,8 +1723,9 @@ impl State {
     ) {
         #[cfg(feature = "diagnostics")]
         self.trace("draw", vertices, first);
-        let rects = self.topology == RECTANGLES;
-        let ran = self.prepare(list, false) && (!rects || self.rectangles(list, vertices, first));
+        let prepared = self.prepare(list, false);
+        let rects = prepared && self.topology == RECTANGLES && !self.screen_rectangle();
+        let ran = prepared && (!rects || self.rectangles(list, vertices, first));
         if ran {
             // Rectangles were expanded into their own vertex buffers.
             let (count, from) = if rects {
@@ -977,18 +1735,28 @@ impl State {
             };
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            let stats = list.begin_draw_stats(self.pipeline as This, "draw");
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawInstanced(count, instances, from, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            list.end_draw_stats(stats);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        self.trace_work(list, "draw", false, ran);
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+
+    fn screen_rectangle(&self) -> bool {
+        crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.screen_rectangle)
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
@@ -1064,13 +1832,19 @@ impl State {
         if ran {
             #[cfg(feature = "diagnostics")]
             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
+            #[cfg(feature = "diagnostics")]
+            let stats = list.begin_draw_stats(self.pipeline as This, "indexed");
             // SAFETY: an open list with everything set.
             unsafe {
                 list.list
                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
             };
+            #[cfg(feature = "diagnostics")]
+            list.end_draw_stats(stats);
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
+        #[cfg(feature = "diagnostics")]
+        self.trace_work(list, "indexed", false, ran);
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
@@ -1089,6 +1863,30 @@ impl State {
     pub(crate) fn execute_indirect(
         &mut self,
         list: &HostList,
+        command: (u32, u32, u32),
+        arguments: u64,
+        count: Option<u64>,
+        #[cfg(feature = "diagnostics")] evidence: (usize, (usize, u64), (usize, u64)),
+    ) -> bool {
+        #[cfg(feature = "diagnostics")]
+        {
+            let (signature, args, counter) = evidence;
+            self.indirect_trace = Some(IndirectTrace { signature, args, counter, command, topology: self.topology,
+                host: 0, slots: 0, reason: "unclassified" });
+        }
+        let ran = self.record_indirect(list, command, arguments, count);
+        #[cfg(feature = "diagnostics")]
+        {
+            if ran && let Some(t) = &mut self.indirect_trace { t.reason = "issued"; }
+            self.trace_work(list, match command.0 { 0 => "indirect draw", 1 => "indirect indexed", 2 => "indirect dispatch", 10 => "indirect mesh", _ => "indirect other" }, command.0 == 2, ran);
+            self.indirect_trace = None;
+        }
+        ran
+    }
+
+    fn record_indirect(
+        &mut self,
+        list: &HostList,
         (kind, stride, max): (u32, u32, u32),
         arguments: u64,
         count: Option<u64>,
@@ -1097,7 +1895,7 @@ impl State {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             crate::pipeline::note_drop(self.pipeline as This);
-            return false;
+            return self.reject("diagnostic-skip");
         }
         const DRAW: u32 = 0;
         const INDEXED: u32 = 1;
@@ -1110,14 +1908,14 @@ impl State {
         let len = u64::from(stride) * u64::from(max.max(1));
         let Some(args) = crate::shadow::find(arguments, len) else {
             why("arguments outside title buffers");
-            return false;
+            return self.reject("args-range");
         };
         let counter = match count {
             Some(at) => match crate::shadow::find(at, 4) {
                 Some(s) => Some((s, at)),
                 None => {
                     why("count outside title buffers");
-                    return false;
+                    return self.reject("count-range");
                 }
             },
             None => None,
@@ -1127,7 +1925,7 @@ impl State {
             .flatten()
         else {
             why("no host signature");
-            return false;
+            return self.reject("signature");
         };
         args.refresh(list, arguments, len);
         if let Some((s, at)) = &counter {
@@ -1136,16 +1934,22 @@ impl State {
         // Bounded first: the clamp binds a compute pipeline of its own.
         if !crate::indirect::bound(list, &args.buffer, args.gpu(arguments), (kind, stride, max)) {
             why("not bounded (no clamp, or arguments not 4-byte aligned)");
-            return false;
+            return self.reject("arg-clamp");
         }
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let ran = match kind {
-            DRAW | INDEXED => self.topology != RECTANGLES && self.prepare(list, kind == INDEXED),
+            DRAW | INDEXED if self.topology == RECTANGLES && (kind == INDEXED || !self.screen_rectangle()) => self.reject("rectangle-topology"),
+            DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => match crate::pipeline::host_pipeline(self.pipeline as This) {
-                Some(p) if p.compute => self.bind(list, p, true),
-                _ => false,
+                Some(p) if p.compute => {
+                    #[cfg(feature = "diagnostics")]
+                    self.indirect_pso(p);
+                    self.bind(list, p, true)
+                },
+                Some(_) => self.reject("pso-type"),
+                None => self.reject("no-host-pso"),
             },
             _ => false,
         };
@@ -1153,7 +1957,10 @@ impl State {
             #[cfg(feature = "diagnostics")]
             match crate::pipeline::host_pipeline(self.pipeline as This) {
                 None => crate::pipeline::note_drop(self.pipeline as This),
-                Some(p) => why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh)),
+                Some(p) => {
+                    self.indirect_pso(p);
+                    why(&format!("prepare failed (compute {}, mesh {})", p.compute, p.mesh));
+                },
             }
             return false;
         }
@@ -1161,6 +1968,16 @@ impl State {
         list.note_op(|| {
             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
         });
+        let uses_root_uav = kind == DISPATCH && crate::pipeline::host_pipeline(self.pipeline as This)
+            .is_some_and(|p| p.stages.iter().any(|s| !s.root_uavs.is_empty()));
+        order_root_uav_writes(list, uses_root_uav);
+        #[cfg(feature = "diagnostics")]
+        let stats = match kind {
+            DRAW => list.begin_draw_stats(self.pipeline as This, "indirect-draw"),
+            INDEXED => list.begin_draw_stats(self.pipeline as This, "indirect-indexed"),
+            MESH => list.begin_mesh_stats(self.pipeline as This, "indirect-mesh"),
+            _ => None,
+        };
         crate::indirect::execute(
             list,
             &signature,
@@ -1168,12 +1985,23 @@ impl State {
             (&args.buffer, args.offset(arguments)),
             counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))),
         );
+        #[cfg(feature = "diagnostics")]
+        list.end_draw_stats(stats);
+        order_root_uav_writes(list, uses_root_uav);
         if kind == DISPATCH {
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);
         }
         true
+    }
+}
+
+/// Order accesses to builder buffers also bound through normal descriptor tables.
+fn order_root_uav_writes(list: &HostList, needed: bool) {
+    if needed {
+        // SAFETY: recording to the same open compute-capable list.
+        unsafe { list.list.ResourceBarrier(&[crate::indirect::uav_barrier()]) };
     }
 }
 
@@ -1311,11 +2139,15 @@ const QUAD_STRIP: u32 = 20;
 
 /// Fixed-function state, straight onto the host list.
 pub(crate) fn viewports(list: &HostList, viewports: &[D3D12_VIEWPORT]) {
+    #[cfg(feature="diagnostics")]
+    list.note_viewports(viewports);
     // SAFETY: an open list.
     unsafe { list.list.RSSetViewports(viewports) };
 }
 
 pub(crate) fn scissors(list: &HostList, rects: &[RECT]) {
+    #[cfg(feature="diagnostics")]
+    list.note_scissors(rects);
     // SAFETY: an open list.
     unsafe { list.list.RSSetScissorRects(rects) };
 }

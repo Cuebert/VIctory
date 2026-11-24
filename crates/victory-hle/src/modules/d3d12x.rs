@@ -19,6 +19,16 @@ extern "system" fn create_device(
 ) -> HRESULT {
     victory_gpu::resource::use_allocator(super::xmem::XMemAlloc, super::xmem::XMemFree);
     victory_gpu::resource::use_page_mapper(super::xmem::map_alias);
+    victory_gpu::resource::use_section_output_retainer(super::xmem::retain_section_output);
+    #[cfg(feature = "diagnostics")]
+    victory_gpu::resource::use_section_coverage(super::xmem::section_coverage);
+    #[cfg(feature = "diagnostics")]
+    victory_gpu::resource::use_allocation_history(super::xmem::range_provenance);
+    #[cfg(feature="diagnostics")]
+    victory_gpu::resource::use_as_identity(super::xmem::as_identity);
+    if std::env::var_os("VICTORY_PARTIAL_TEXTURES").is_some() {
+        victory_gpu::resource::use_texture_page_reader(super::xmem::read_texture_pages);
+    }
     #[cfg(windows)]
     victory_gpu::on_failure(host_gpu_failed);
     device::create(adapter, parameters, iid, out)

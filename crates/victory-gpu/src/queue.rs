@@ -276,8 +276,18 @@ extern "system" fn present(
         }
     }
     #[cfg(all(windows, feature = "diagnostics"))]
+    let fallback_1440p = crate::capture::take_1440p_target();
+    #[cfg(all(windows, feature = "diagnostics"))]
+    if fallback_1440p.is_some() && crate::capture::dump_on() {
+        crate::capture::first_preview(frame);
+    }
+    #[cfg(all(windows, feature = "diagnostics"))]
     if crate::capture::listed(frame) {
+        let started = std::time::Instant::now();
+        crate::capture::save_passes(frame);
+        crate::capture::save_history(frame);
         crate::capture::dump_targets(frame);
+        tracing::info!(frame, ms = started.elapsed().as_millis(), "capture dump elapsed wall time");
     }
     #[cfg(windows)]
     if planes > 0
@@ -288,7 +298,19 @@ extern "system" fn present(
         // SAFETY: the title passes `planes` plane descriptions.
         let slice = unsafe { std::slice::from_raw_parts(plane_parameters, planes.min(8) as usize) };
         let mut resources = Vec::with_capacity(slice.len());
-        for plane in slice {
+        for (_i, plane) in slice.iter().enumerate() {
+            #[cfg(feature = "diagnostics")]
+            if crate::capture::listed(frame) && crate::capture::dump_on() {
+                tracing::info!(frame, planes, plane = _i, items = plane.count, "title PresentX plane");
+                if !plane.resources.is_null() {
+                    // SAFETY: the ABI provides an array of count title resources.
+                    for (j, &r) in unsafe { std::slice::from_raw_parts(plane.resources, plane.count.min(8) as usize) }.iter().enumerate() {
+                        let desc = crate::resource::host_resource(r).map(|t| unsafe { t.GetDesc() });
+                        tracing::info!(frame, plane = _i, item = j, resource = ?r,
+                            host = ?desc.map(|d| (d.Width, d.Height, d.Format.0)), "title PresentX source");
+                    }
+                }
+            }
             if plane.count == 0 || plane.resources.is_null() {
                 continue;
             }
@@ -300,8 +322,6 @@ extern "system" fn present(
                 resources.push((resource, texture, state));
             }
         }
-        #[cfg(feature = "diagnostics")]
-        let fallback_1440p = crate::capture::take_1440p_target();
         if !resources.is_empty() {
             #[cfg_attr(not(feature = "diagnostics"), allow(unused_mut))]
             let mut sources: Vec<(&_, u32)> = resources
@@ -309,10 +329,18 @@ extern "system" fn present(
                 .map(|(_, tex, state)| (*tex, *state))
                 .collect();
             #[cfg(feature = "diagnostics")]
-            if let Some(ref copy) = fallback_1440p {
-                let state = crate::host::legal_state(
-                    &copy.texture,
-                    copy.state.load(Ordering::Relaxed),
+            let path = if let Some((id, ref copy)) = fallback_1440p {
+                if crate::capture::dump_on() && crate::capture::listed(frame) {
+                    // Construct the title's requested composition with the exact
+                    // original planes and read it back before substituting plane 0.
+                    // CaptureTitle does not flip the swap chain or count a frame.
+                    let _ = host.present(&sources, frame, crate::host::PresentPath::CaptureTitle);
+                    tracing::info!(frame, original = ?resources[0].0, selected = format_args!("{id:#x}"),
+                        "substituting game-produced 1440p target for plane zero");
+                }
+                let state = sources.iter().find(|(tex, _)| *tex == &copy.texture).map_or_else(
+                    || crate::host::legal_state(&copy.texture, copy.state.load(Ordering::Relaxed)),
+                    |(_, state)| *state,
                 );
                 static ONCE: std::sync::Once = std::sync::Once::new();
                 ONCE.call_once(|| {
@@ -326,8 +354,13 @@ extern "system" fn present(
                     );
                 });
                 sources[0] = (&copy.texture, state);
-            }
-            let shown = host.present(&sources, frame);
+                crate::host::PresentPath::ScenePreview
+            } else {
+                crate::host::PresentPath::Title
+            };
+            #[cfg(not(feature = "diagnostics"))]
+            let path = crate::host::PresentPath::Title;
+            let shown = host.present(&sources, frame, path);
             for &(resource, _, state) in &resources {
                 crate::resource::host_transition(resource, state);
             }
@@ -339,6 +372,8 @@ extern "system" fn present(
     }
     #[cfg(not(windows))]
     let _ = (planes, plane_parameters);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::capture::poll_request(frame);
     S_OK
 }
 /// Diagnostics: logs a presented frame that is black after one that was

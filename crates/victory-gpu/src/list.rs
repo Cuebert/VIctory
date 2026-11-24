@@ -114,7 +114,7 @@ struct List {
     /// Ours, after the console layout: memory handed out by
     /// [`allocate_upload`], kept until the list is reset; the host list the
     /// calls record into (decision 0007), and the draw state the title set.
-    uploads: std::sync::Mutex<Vec<Vec<u8>>>,
+    uploads: std::sync::Mutex<Vec<std::sync::Arc<CommandUpload>>>,
     #[cfg(windows)]
     host: Option<crate::host::HostList>,
     #[cfg(windows)]
@@ -122,6 +122,46 @@ struct List {
 }
 const _: () = assert!(offset_of!(List, put) == 0x18);
 const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
+
+/// Storage returned by this list's AllocateUploadBuffer. The alignment
+/// padding belongs to the allocator and is outside the caller's allocation.
+pub(crate) struct CommandUpload {
+    block: Vec<u8>,
+    offset: usize,
+    size: usize,
+}
+
+impl CommandUpload {
+    fn address(&self) -> *mut u8 {
+        self.block.as_ptr().wrapping_add(self.offset).cast_mut()
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    fn contains(&self, address: usize, len: usize) -> bool {
+        len > 0 && address.checked_sub(self.address() as usize)
+            .and_then(|offset| offset.checked_add(len)).is_some_and(|end| end <= self.size)
+    }
+
+    #[cfg(all(windows, feature = "diagnostics"))]
+    pub(crate) fn snapshot(&self, address: usize, len: usize) -> Option<Vec<u8>> {
+        if !self.contains(address, len) { return None; }
+        let offset = address - self.address() as usize;
+        // SAFETY: the owned allocation covers the exact range. The title
+        // has completed the CPU writes to these arguments at dispatch.
+        Some(unsafe { std::slice::from_raw_parts(self.address().add(offset), len) }.to_vec())
+    }
+}
+
+#[cfg(all(windows, feature = "diagnostics"))]
+fn find_list_upload(this: This, address: usize, len: usize) -> Option<std::sync::Arc<CommandUpload>> {
+    if this.is_null() { return None; }
+    // SAFETY: called only with the same live facade list receiving dispatch.
+    let uploads = unsafe { &(*this.cast::<List>()).uploads };
+    let uploads = uploads.lock().unwrap_or_else(|e| e.into_inner());
+    let mut matches = uploads.iter().filter(|block| block.contains(address, len));
+    let found = matches.next()?;
+    matches.next().is_none().then(|| std::sync::Arc::clone(found))
+}
 
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
@@ -432,7 +472,7 @@ extern "system" fn copy_buffer_region(
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
-        list.defer_copy(to, from, len as usize);
+        list.defer_copy(to, from, len as usize, true);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_offset, src, src_offset, len);
@@ -449,6 +489,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             crate::resource::host_resource(src),
         ) {
             if crate::resource::skip_mixed_packed_copy("CopyResource", to, from) {
+                #[cfg(feature = "diagnostics")]
+                crate::capture::transfer(list, "CopyResource", src as usize, dst as usize, false);
                 return;
             }
             ensure_state(list, dst, COPY_DEST);
@@ -458,11 +500,13 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
             // SAFETY: an open list and live textures.
             unsafe { list.list.CopyResource(to, from) };
+            #[cfg(feature = "diagnostics")]
+            crate::capture::transfer(list, "CopyResource", src as usize, dst as usize, true);
         } else if let (Some((to, a)), Some((from, b))) = (
             crate::resource::buffer_bytes(dst),
             crate::resource::buffer_bytes(src),
         ) {
-            list.defer_copy(to, from, a.min(b) as usize);
+            list.defer_copy(to, from, a.min(b) as usize, true);
         }
     }
     #[cfg(not(windows))]
@@ -555,7 +599,7 @@ fn prepare_footprint_upload(
         return Some((buffer, from, dst_bytes));
     }
     let (buffer, staging) = list.upload(host, bytes)?;
-    list.defer_copy(staging, data, bytes as usize);
+    list.defer_copy(staging, data, bytes as usize, false);
     from.resource = buffer.as_raw().cast_const().cast();
     from.footprint.offset = 0;
     Some((buffer, from, bytes))
@@ -613,6 +657,8 @@ extern "system" fn copy_texture_region(
                 return;
             };
             if crate::resource::skip_mixed_packed_copy("CopyTextureRegion", to, texture) {
+                #[cfg(feature = "diagnostics")]
+                crate::capture::transfer(list, "CopyTextureRegion", src.resource as usize, dst.resource as usize, false);
                 return;
             }
             ensure_state(list, src.resource, COPY_SOURCE);
@@ -621,6 +667,8 @@ extern "system" fn copy_texture_region(
         ensure_state(list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
+        #[cfg(feature = "diagnostics")]
+        crate::capture::transfer(list, "CopyTextureRegion", src.resource as usize, dst.resource as usize, true);
         to_location.resource = to.as_raw().cast_const().cast();
         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
         #[cfg(feature = "diagnostics")]
@@ -715,9 +763,13 @@ extern "system" fn resolve(
             let (a, b) = (to.GetDesc(), from.GetDesc());
             let format = DXGI_FORMAT(format as i32);
             if (a.Width, a.Height) == (b.Width, b.Height) {
+                #[cfg(feature = "diagnostics")]
+                crate::capture::transfer(list, "ResolveSubresource", src as usize, dst as usize, true);
                 list.list
                     .ResolveSubresource(to, dst_sub, from, src_sub, format);
             } else if let Ok(list1) = list.list.cast::<ID3D12GraphicsCommandList1>() {
+                #[cfg(feature = "diagnostics")]
+                crate::capture::transfer(list, "ResolveSubresourceRegion", src as usize, dst as usize, true);
                 // The console clips a larger source to the destination.
                 let rect = RECT {
                     left: 0,
@@ -791,6 +843,8 @@ extern "system" fn clear_rtv(
                 )]);
             }
             list.list.ClearRenderTargetView(rtv, color, rects);
+            #[cfg(feature = "diagnostics")]
+            crate::capture::transfer(list, "ClearRenderTargetView", 0, record.resource as usize, true);
         }
     }
     #[cfg(not(windows))]
@@ -969,10 +1023,10 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
     if this.is_null() || !align.is_power_of_two() {
         return std::ptr::null_mut();
     }
-    let mut block = vec![0u8; len];
-    let start = block.as_mut_ptr();
-    // SAFETY: the offset is below `align`, so `size` bytes fit after it.
-    let at = unsafe { start.add(start.align_offset(align)) };
+    let block = vec![0u8; len];
+    let offset = block.as_ptr().align_offset(align);
+    let block = std::sync::Arc::new(CommandUpload { block, offset, size: len - align });
+    let at = block.address();
     // SAFETY: the title passes one of our lists.
     let uploads = unsafe { &(*this.cast::<List>()).uploads };
     // Moving the vector keeps its heap block where it is.
@@ -984,6 +1038,15 @@ extern "system" fn allocate_upload(this: This, size: u64, alignment: u64) -> *mu
 /// the pipeline; depth bounds, depth order and shading rate hints): any
 /// arguments, nothing returned.
 extern "system" fn ignored_state(_: This) {}
+
+extern "system" fn compute_signature(this: This, signature: This) {
+    #[cfg(windows)]
+    if crate::section_reset::enabled() || crate::draw::triangle_inputs::enabled() {
+        with_state(this, |_, s| s.set_compute_signature(signature as usize));
+    }
+    #[cfg(not(windows))]
+    let _ = (this, signature);
+}
 
 extern "system" fn depth_bounds(this: This, min: f32, max: f32) {
     #[cfg(windows)]
@@ -1135,7 +1198,13 @@ mod state {
     }
     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
         super::count_dispatch();
-        with_state(this, |list, s| s.dispatch(list, x, y, z));
+        with_state(this, |list, s| {
+            #[cfg(feature = "diagnostics")]
+            s.trace_init_headers_source(list, [x, y, z], |address, len| {
+                super::find_list_upload(this, address, len)
+            });
+            s.dispatch(list, x, y, z)
+        });
     }
     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
     /// programs take `x` groups only.
@@ -1252,7 +1321,8 @@ extern "system" fn execute_indirect(
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
         with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            ran = s.execute_indirect(list, (kind, stride, max), address, counter,
+                #[cfg(feature = "diagnostics")] (signature as usize, (arguments as usize, offset), (count as usize, count_offset)));
         });
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]
@@ -1385,7 +1455,7 @@ const METHODS: [(usize, *const ()); 52] = [
     (25, set_pipeline as *const ()),              // 0xc8
     (26, barrier as *const ()),                   // 0xd0
     (32, state::heaps as *const ()),              // 0x100
-    (33, ignored_state as *const ()),             // 0x108 compute root signature
+    (33, compute_signature as *const ()),         // 0x108 compute root signature
     (34, ignored_state as *const ()),             // 0x110 graphics root signature
     (35, state::compute_table as *const ()),      // 0x118
     (36, state::graphics_table as *const ()),     // 0x120
@@ -1492,6 +1562,40 @@ mod tests {
     use super::*;
     use crate::object::slot;
 
+    #[cfg(all(windows,feature="diagnostics"))]
+    #[test]
+    #[ignore = "uses a dedicated native D3D12 queue and capture frame"]
+    fn original_list_upload_observes_late_writes_before_native_execution() {
+        use std::sync::{Arc,Mutex};
+        let null=std::ptr::null();
+        let mut allocator=null; let mut list=null;
+        assert_eq!(create_allocator(null,0,&ALLOCATOR_IIDS[0],&mut allocator),S_OK);
+        assert_eq!(create_list(null,0,0,allocator,null,&LIST_IIDS[1],&mut list),S_OK);
+        let p=allocate_upload(list,40,16);
+        let address=p as usize;
+        let upload=find_list_upload(list,address,40).unwrap();
+        assert_eq!(upload.snapshot(address,40).unwrap(),[0u8;40]);
+        let host=crate::host::host().unwrap();
+        let recorder=host_list(list).unwrap();
+        let seen=Arc::new(Mutex::new(Vec::new()));
+        recorder.retain_init_header_records(crate::draw::init_headers_source::HeldRecords::fixture(
+            upload.clone(),address as u64,40,seen.clone()));
+        let later=Arc::new(Mutex::new(0x21u8));
+        let fill=later.clone();
+        recorder.defer_host(move|| {
+            // SAFETY: the command-list upload is held throughout the submission.
+            unsafe {upload.address().write_bytes(*fill.lock().unwrap(),40);}
+        });
+        crate::capture::first_preview(crate::queue::presented()+1);
+        recorder.close();
+        for expected in [0x21,0x7b] {
+            *later.lock().unwrap()=expected;
+            host.execute(&[recorder]);
+            assert_eq!(*seen.lock().unwrap(),vec![expected;40]);
+        }
+        crate::object::release(list); crate::object::release(allocator);
+    }
+
     #[test]
     fn every_inline_command_falls_back_to_the_table() {
         let null = std::ptr::null();
@@ -1525,10 +1629,25 @@ mod tests {
         assert!(!p.is_null() && (p as usize).is_multiple_of(0x100));
         // SAFETY: 40 bytes were handed out.
         unsafe { p.write_bytes(0xab, 40) };
+        #[cfg(all(windows, feature = "diagnostics"))]
+        let retained = {
+            let address = p as usize;
+            assert!(find_list_upload(list, address - 1, 1).is_none());
+            assert!(find_list_upload(list, address + 4, 37).is_none());
+            assert!(find_list_upload(list, address + 40, 1).is_none());
+            let retained = find_list_upload(list, address, 40).unwrap();
+            assert_eq!(retained.snapshot(address + 4, 36).unwrap(), vec![0xab; 36]);
+            retained
+        };
         assert!(allocate_upload(list, 8, 0x30).is_null(), "not a power of two");
         assert_eq!(reset(list, allocator, null), S_OK);
         // SAFETY: the list is ours.
         assert!(unsafe { &(*list.cast::<List>()).uploads }.lock().unwrap().is_empty());
+        #[cfg(all(windows, feature = "diagnostics"))]
+        {
+            assert!(find_list_upload(list, p as usize, 40).is_none());
+            assert_eq!(retained.snapshot(p as usize, 40).unwrap(), vec![0xab; 40]);
+        }
         let release = |o: This| slot::<extern "system" fn(This) -> u32>(o, 0x10)(o);
         assert_eq!(release(list), 0);
         assert_eq!(release(allocator), 0);

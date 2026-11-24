@@ -32,6 +32,14 @@ use windows_sys::core::BOOL;
 
 use crate::{HleModule, hle_export};
 
+#[cfg(feature = "diagnostics")]
+mod provenance;
+#[cfg(feature = "diagnostics")]
+pub(crate) use provenance::describe as range_provenance;
+
+mod section_output;
+pub(crate) use section_output::retain as retain_section_output;
+
 const MIB: usize = 1 << 20;
 
 /// Whether we run under Wine (its ntdll exports `wine_get_version`).
@@ -153,6 +161,11 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    #[cfg(feature = "diagnostics")]
+    if kind & MEM_RESERVE != 0 && !at.is_null() {
+        let origin = if placeholder { provenance::Origin::Placeholder } else { provenance::Origin::Reservation };
+        provenance::add(at as usize, size, origin);
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -258,7 +271,10 @@ pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
         hook => {
             // SAFETY: the title's own routine of this type.
             let alloc: AllocRoutine = unsafe { std::mem::transmute(hook) };
-            alloc(size, attributes)
+            let at = alloc(size, attributes);
+            #[cfg(feature = "diagnostics")]
+            provenance::add(at as usize, size, provenance::Origin::Callback);
+            at
         }
     }
 }
@@ -270,6 +286,8 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
         hook => {
             // SAFETY: the title's own routine of this type.
             let free: FreeRoutine = unsafe { std::mem::transmute(hook) };
+            #[cfg(feature = "diagnostics")]
+            provenance::remove(address as usize, provenance::Origin::Callback);
             free(address, attributes)
         }
     }
@@ -278,13 +296,16 @@ pub extern "system" fn XMemFree(address: *mut c_void, attributes: u64) {
 /// The system allocator behind [`XMemAlloc`].
 pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_void {
     if attributes & ALLOC_32BIT != 0 {
-        return XMemVirtualAlloc(
+        let at = XMemVirtualAlloc(
             std::ptr::null_mut(),
             size,
             MEM_RESERVE | MEM_COMMIT,
             GRAPHICS | ADDRESS_32BIT,
             PAGE_READWRITE,
         );
+        #[cfg(feature = "diagnostics")]
+        provenance::add(at as usize, size, provenance::Origin::Default);
+        return at;
     }
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
@@ -305,6 +326,8 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
         user.sub(HEADER)
             .cast::<[usize; 2]>()
             .write([layout.size(), layout.align()]);
+        #[cfg(feature = "diagnostics")]
+        provenance::add(user as usize, size, provenance::Origin::Default);
         user.cast()
     }
 }
@@ -314,11 +337,16 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
     if address.is_null() {
         return;
     }
+    #[cfg(feature = "diagnostics")]
+    provenance::remove(address as usize, provenance::Origin::Default);
     // SAFETY: the address came from `XMemAlloc` with these attributes: a
     // whole reservation, or a header-prefixed block.
     unsafe {
         if attributes & ALLOC_32BIT != 0 {
-            VirtualFree(address, 0, MEM_RELEASE);
+            let freed = VirtualFree(address, 0, MEM_RELEASE);
+            #[cfg(feature = "diagnostics")]
+            if freed != 0 { provenance::remove(address as usize, provenance::Origin::Reservation); }
+            let _ = freed;
             return;
         }
         let user = address.cast::<u8>();
@@ -342,7 +370,7 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+struct Section(HANDLE, #[cfg(feature="diagnostics")] u64);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -382,6 +410,157 @@ static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
 
 fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Metadata only. A stable section serial and byte offset survive a second VA alias.
+#[cfg(feature="diagnostics")]
+pub fn as_identity(address:u64,width:u64)->Option<(u8,u64,u64)> {
+    let at=usize::try_from(address).ok()?;
+    let n=usize::try_from(width).ok()?;
+    let end=at.checked_add(n)?;
+    if n==0 {return None;}
+    {
+        let state=physical();
+        if let Some((&base,(len,slice)))=state.views.range(..=at).next_back()
+            && base.checked_add(*len)? >= end {
+            let offset=slice.index.checked_mul(PAGE)?.checked_add(at-base)?;
+            return (slice.section.1 != 0).then_some((1,slice.section.1,offset as u64));
+        }
+        // A partly covered section cannot be reclassified as private.
+        if state.views.range(at..end).next().is_some() ||
+            state.views.range(..=at).next_back().is_some_and(|(&base,(len,_))|base.saturating_add(*len)>at) {
+            return None;
+        }
+    }
+    provenance::reservation_id(at,end)
+}
+
+/// Returns the number of bytes in each span covered by registered physical
+/// mappings at one observation. Only the view registry is consulted.
+#[cfg(feature = "diagnostics")]
+pub fn section_coverage(spans: &[(u64, u64)]) -> Vec<u64> {
+    // Each interval records the cumulative number of covered bytes before
+    // its start. Adjacent views can belong to different physical sections.
+    let intervals = {
+        let state = physical();
+        let mut intervals = Vec::with_capacity(state.views.len());
+        let mut covered = 0u64;
+        for (&start, (len, _)) in &state.views {
+            let start = start as u64;
+            let Some(end) = start.checked_add(*len as u64) else { continue };
+            intervals.push((start, end, covered));
+            covered += end - start;
+        }
+        intervals
+    };
+    let prefix = |point: u64| {
+        let n = intervals.partition_point(|&(start, _, _)| start < point);
+        if n == 0 { return 0; }
+        let (start, end, covered) = intervals[n - 1];
+        covered + (point.min(end) - start)
+    };
+    spans.iter().map(|&(start, len)| {
+        start.checked_add(len).map_or(0, |end| prefix(end) - prefix(start))
+    }).collect()
+}
+
+/// Reads only the title physical sections registered for a tiled interval.
+/// Owning each section while mapping an independent read-only view avoids
+/// following a stale virtual address after an unmap or a remap.
+pub fn read_texture_pages(start: usize, dst: &mut [u8]) -> Vec<(usize, usize)> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::Memory::{FILE_MAP_READ, MapViewOfFile, UnmapViewOfFile};
+    let Some(end) = start.checked_add(dst.len()).filter(|&end| start < end) else {
+        return Vec::new();
+    };
+    struct Run {
+        section: Arc<Section>,
+        offset: usize,
+        from: usize,
+        to: usize,
+    }
+    let mut runs: Vec<Run> = Vec::new();
+    {
+        let p = physical();
+        let first = p
+            .views
+            .range(..=start)
+            .next_back()
+            .map_or(start, |(&lo, _)| lo);
+        for (&lo, (n, slice)) in p.views.range(first..end) {
+            let (a, b) = (lo.max(start), lo.saturating_add(*n).min(end));
+            if a >= b {
+                continue;
+            }
+            let Some(offset) = slice
+                .index
+                .checked_mul(PAGE)
+                .and_then(|v| v.checked_add(a - lo))
+            else {
+                continue;
+            };
+            if let Some(prev) = runs.last_mut()
+                && prev.to == a - start
+                && Arc::ptr_eq(&prev.section, &slice.section)
+                && prev.offset.checked_add(prev.to - prev.from) == Some(offset)
+            {
+                prev.to = b - start;
+            } else {
+                runs.push(Run {
+                    section: slice.section.clone(),
+                    offset,
+                    from: a - start,
+                    to: b - start,
+                });
+            }
+        }
+    }
+    let mut filled: Vec<(usize, usize)> = Vec::new();
+    for run in runs {
+        let within = run.offset % PAGE;
+        let offset = (run.offset - within) as u64;
+        let n = run.to - run.from;
+        let Some(mapped_size) = within.checked_add(n) else {
+            continue;
+        };
+        // SAFETY: the handle belongs to the retained physical section;
+        // the mapping is read-only and owned by this call until its unmap.
+        let view = unsafe {
+            MapViewOfFile(
+                run.section.0,
+                FILE_MAP_READ,
+                (offset >> 32) as u32,
+                offset as u32,
+                mapped_size,
+            )
+        };
+        if view.Value.is_null() {
+            continue;
+        }
+        let mut count = 0;
+        // SAFETY: OS-checked read from our independent section mapping into
+        // the initialized destination subrange. No title VA is dereferenced.
+        let ok = unsafe {
+            ReadProcessMemory(
+                GetCurrentProcess(),
+                view.Value.cast::<u8>().add(within).cast(),
+                dst[run.from..run.to].as_mut_ptr().cast(),
+                n,
+                &mut count,
+            )
+        };
+        unsafe { UnmapViewOfFile(view) };
+        if ok != 0 && count == n {
+            if let Some(last) = filled.last_mut()
+                && last.1 == run.from
+            {
+                last.1 = run.to
+            } else {
+                filled.push((run.from, run.to))
+            }
+        }
+    }
+    filled
 }
 
 /// `count` is in and out (pages wanted, pages given); all or nothing here.
@@ -428,9 +607,15 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         flags = format_args!("{flags:#x}"),
         "XMemAllocatePhysicalPages"
     );
-    let section = Arc::new(Section(handle));
     let mut physical = physical();
     let first = physical.next_page;
+    #[cfg(feature="diagnostics")]
+    let generation = {
+        use std::sync::atomic::{AtomicU64,Ordering};
+        static NEXT:AtomicU64=AtomicU64::new(1);
+        NEXT.fetch_update(Ordering::Relaxed,Ordering::Relaxed,|n|n.checked_add(1)).unwrap_or(0)
+    };
+    let section = Arc::new(Section(handle, #[cfg(feature="diagnostics")] generation));
     physical.next_page += n * FRAMES;
     for index in 0..n {
         let slice = Slice {
@@ -954,6 +1139,14 @@ mod tests {
         assert_eq!(info.host.State, MEM_COMMIT);
         assert_eq!(info.host.Protect, PAGE_READWRITE);
         assert_eq!(info.flags & GRAPHICS, GRAPHICS);
+        #[cfg(feature = "diagnostics")]
+        {
+            let evidence = range_provenance(p as u64 + 256, 64);
+            assert!(evidence.contains("reservation_observed=true"));
+            assert!(evidence.contains("native_state=committed"));
+            assert!(evidence.contains("native_base_matches_xmem=true"));
+            assert_eq!(range_provenance(u64::MAX, 64), "invalid span");
+        }
         // Write-watched, for the GPU side's copies.
         let (mut found, mut count, mut granularity) = ([0usize; 4], 4, 0);
         // SAFETY: room for `count` addresses.
@@ -1057,6 +1250,17 @@ mod tests {
             XMemMapPhysicalPages(at(b, 1), 1, pages[2..].as_ptr()),
             at(b, 1)
         );
+        #[cfg(feature="diagnostics")]
+        {
+            let first = as_identity(at(a,2) as u64+96,64).unwrap();
+            assert_eq!(first.0,1);
+            assert_eq!(Some(first), as_identity(at(b,1) as u64+96,64));
+            assert_ne!(Some(first), as_identity(a as u64+96,64));
+            // Remapping this same virtual address to another physical page changes its offset.
+            assert_eq!(XMemMapPhysicalPages(at(b,1),1,pages.as_ptr()),at(b,1));
+            assert_ne!(Some(first),as_identity(at(b,1) as u64+96,64));
+            assert_eq!(XMemMapPhysicalPages(at(b,1),1,pages[2..].as_ptr()),at(b,1));
+        }
         // SAFETY: both pages are mapped read-write.
         unsafe {
             at(a, 2).cast::<u8>().write(7);
@@ -1074,8 +1278,42 @@ mod tests {
             at(a, 1)
         );
         assert_eq!(query(at(a, 1)).host.State, MEM_RESERVE);
+        #[cfg(feature="diagnostics")]
+        assert!(as_identity(a as u64 + PAGE as u64 - 16,64).is_none());
         assert_eq!(query(a).host.State, MEM_COMMIT);
         assert_eq!(query(at(a, 2)).host.State, MEM_COMMIT);
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(section_coverage(&[
+            (a as u64, (3 * PAGE) as u64),
+            (a as u64 + PAGE as u64 - 4, PAGE as u64 + 8),
+            (at(a, 1) as u64, PAGE as u64),
+            (at(a, 2) as u64, 0),
+            (u64::MAX - 1, 8),
+        ]), [(2 * PAGE) as u64, 8, 0, 0, 0]);
+        // A texture reads the two registered physical sections, with the
+        // evicted middle page left alone. The range may start in a page.
+        let mut sparse = vec![0xc7; 3 * PAGE];
+        assert_eq!(
+            read_texture_pages(a as usize, &mut sparse),
+            [(0, PAGE), (2 * PAGE, 3 * PAGE)]
+        );
+        assert_eq!(
+            (sparse[0], sparse[2 * PAGE], sparse[2 * PAGE + 1]),
+            (1, 7, 9)
+        );
+        assert!(sparse[PAGE..2 * PAGE].iter().all(|&b| b == 0xc7));
+        let mut clipped = vec![0x8b; PAGE + 16];
+        assert_eq!(
+            read_texture_pages(a as usize + PAGE - 8, &mut clipped),
+            [(0, 8), (PAGE + 8, PAGE + 16)]
+        );
+        // Regular private host memory, even when fully readable, is never
+        // a source for physical streaming. Neither is an overflowing range.
+        let private = vec![0x5au8; PAGE];
+        let mut ignored = [0xa8; 64];
+        assert!(read_texture_pages(private.as_ptr() as usize, &mut ignored).is_empty());
+        assert!(read_texture_pages(usize::MAX - 5, &mut ignored).is_empty());
+        assert_eq!(ignored, [0xa8; 64]);
         // SAFETY: still mapped.
         assert_eq!(unsafe { at(a, 2).cast::<u8>().read() }, 7);
 
@@ -1118,6 +1356,170 @@ mod tests {
     fn page_bytes(page: usize) -> Vec<u8> {
         let slice = physical().pages.get(&page).cloned().expect("known page");
         View::map(&slice, 1).expect("mapped").bytes().to_vec()
+    }
+
+    #[test]
+    fn retained_reset_output_follows_the_original_section_across_remap() {
+        let original = allocate(2);
+        let replacement = allocate(2);
+        let reserve = || XMemVirtualAlloc(
+            std::ptr::null_mut(), 2 * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE,
+        );
+        let (recorded, alias) = (reserve(), reserve());
+        assert!(!recorded.is_null() && !alias.is_null());
+        let next = recorded.wrapping_byte_add(PAGE);
+        let output = recorded as u64 + PAGE as u64 - 16;
+        // The bases a record allows: its DWORDs (`output + 4` ends in hex 4,
+        // like most of the title's). Two records from any of them cross the
+        // page boundary.
+        const BASES: [u64; 4] = [0, 4, 8, 12];
+        let refused = |why: &str| {
+            for delta in BASES {
+                assert!(retain_section_output(output + delta, 32).is_none(), "{why}, +{delta}");
+            }
+        };
+        let map_page = |at, page: &usize| assert_eq!(XMemMapPhysicalPages(at, 1, page), at);
+        map_page(recorded, &original[0]);
+        refused("unmapped second half");
+        map_page(next, &replacement[1]);
+        refused("different section");
+        map_page(next, &original[0]);
+        refused("repeated physical page");
+        map_page(next, &original[1]);
+        let lease = retain_section_output(output, 32).expect("adjacent physical slices");
+        let dword = [4u64, 8, 12].map(|delta| {
+            (delta, retain_section_output(output + delta, 32).expect("DWORD-aligned base"))
+        });
+        // No other byte of a record is a base.
+        for delta in [1u64, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15] {
+            assert!(retain_section_output(output + delta, 32).is_none(), "+{delta}");
+        }
+        // Whatever the base: no partial record, no empty or oversized output,
+        for delta in BASES {
+            for len in [0, 4, 8, 12, 17, 20, 28, 36, 32 << 20] {
+                let partial = retain_section_output(output + delta, len);
+                assert!(partial.is_none(), "+{delta}, {len} bytes");
+            }
+        }
+        // no range that wraps or starts at null, and no memory that is not
+        // mapped physical pages: the host's own, a reservation with nothing
+        // mapped, or a DWORD before the first mapped page or after the last.
+        for address in [0, u64::MAX - 15, u64::MAX - 11, u64::MAX - 3] {
+            assert!(retain_section_output(address, 32).is_none(), "{address:#x}");
+        }
+        let private = [0u128; 4];
+        for delta in BASES {
+            assert!(retain_section_output(private.as_ptr() as u64 + delta, 32).is_none());
+            let unmapped = alias as u64 + PAGE as u64 - 16 + delta;
+            assert!(retain_section_output(unmapped, 32).is_none(), "+{delta}");
+        }
+        assert!(retain_section_output(recorded as u64 - 4, 32).is_none());
+        assert!(retain_section_output(recorded as u64 + 2 * PAGE as u64 - 28, 32).is_none());
+        assert_eq!(XMemMapPhysicalPages(alias, 2, original.as_ptr()), alias);
+        // A record further than any retained range reaches, on either side.
+        assert!(write_physical(&original, PAGE - 32, &[0xa5; 64]));
+        assert!(write_physical(&replacement, PAGE - 32, &[0x7e; 64]));
+        // Each lease names the original section at its own byte offset.
+        #[cfg(feature = "diagnostics")]
+        let identity = {
+            let (kind, serial, offset) =
+                as_identity(alias as u64 + PAGE as u64 - 16, 32).expect("mapped alias");
+            assert_eq!((kind, offset), (1, PAGE as u64 - 16));
+            move |delta: u64| Some((serial, offset + delta))
+        };
+        #[cfg(feature = "diagnostics")]
+        {
+            assert_eq!(lease.physical_identity(), identity(0));
+            for (delta, retained) in &dword {
+                assert_eq!(retained.physical_identity(), identity(*delta), "+{delta}");
+            }
+        }
+        map_page(recorded, &replacement[0]);
+        map_page(next, &replacement[1]);
+        assert_eq!(XMemFreePhysicalPages(2, original.as_ptr()), 1);
+        let observed = |base: *mut c_void| {
+            let mut bytes = [0u8; 34];
+            let spans = read_texture_pages(base as usize + PAGE - 17, &mut bytes);
+            assert_eq!(spans.iter().map(|&(lo, hi)| hi - lo).sum::<usize>(), bytes.len());
+            bytes
+        };
+        assert!(!lease.store(&[0x12; 16]));
+        assert!(!lease.store(&[0x12; 48]));
+        assert_eq!(observed(alias), [0xa5; 34]);
+        for value in [0x19, 0x8f] {
+            assert!(lease.store(&[value; 32]));
+            let mut expected = [value; 34];
+            expected[0] = 0xa5;
+            expected[33] = 0xa5;
+            assert_eq!(observed(alias), expected);
+            assert_eq!(observed(recorded), [0x7e; 34]);
+        }
+        let current = retain_section_output(output, 32).unwrap();
+        assert!(current.store(&[0x57; 32]));
+        assert_eq!(&observed(recorded)[1..33], &[0x57; 32]);
+        assert_eq!(&observed(alias)[1..33], &[0x8f; 32]);
+
+        // The same from DWORD bases, where the bytes just before the output
+        // are the title's as much as those after it. Bytes `[PAGE - 32,
+        // PAGE + 32)` of a mapping; `output` is byte 16 of them.
+        let window = |base: *mut c_void| {
+            let mut bytes = [0u8; 64];
+            let spans = read_texture_pages(base as usize + PAGE - 32, &mut bytes);
+            assert_eq!(spans.iter().map(|&(lo, hi)| hi - lo).sum::<usize>(), bytes.len());
+            bytes
+        };
+        // The recorded bases, retained now, name the section mapped there now.
+        let fresh = [4u64, 8, 12].map(|delta| {
+            (delta, retain_section_output(output + delta, 32).expect("remapped DWORD base"))
+        });
+        // Leases, a mapping of their section, a mapping of the other one, and
+        // what tells their records from every other byte written here.
+        for (leases, shown, other, tag) in
+            [(&dword, alias, recorded, 0u8), (&fresh, recorded, alias, 0x60)]
+        {
+            for (delta, retained) in leases {
+                let start = 16 + *delta as usize;
+                let records: [u8; 32] =
+                    std::array::from_fn(|i| tag + ((*delta as u8) << 3) + i as u8);
+                let (before, untouched) = (window(shown), window(other));
+                assert!(before.iter().all(|b| !records.contains(b)), "+{delta}: telling");
+                // Only the exact length is stored.
+                for wrong in [16, 28, 36, 48] {
+                    assert!(!retained.store(&[0xee; 48][..wrong]), "+{delta}, {wrong} bytes");
+                }
+                assert_eq!(window(shown), before, "+{delta}: refused stores");
+                assert!(retained.store(&records), "+{delta}");
+                let after = window(shown);
+                assert_eq!(after[start..start + 32], records, "+{delta}: the records");
+                // The alignment bytes of the first record and the words
+                // before them, then the words after the last record.
+                assert_eq!(after[..start], before[..start], "+{delta}: before");
+                assert_eq!(after[start + 32..], before[start + 32..], "+{delta}: after");
+                assert_eq!(window(other), untouched, "+{delta}: the other section");
+            }
+        }
+        // Neither the remap nor the release of its pages changed what a lease
+        // names; its guest base now names the same bytes of another section.
+        #[cfg(feature = "diagnostics")]
+        {
+            assert_eq!(lease.physical_identity(), identity(0));
+            assert_ne!(current.physical_identity(), identity(0));
+            for ((delta, retained), (_, remapped)) in dword.iter().zip(&fresh) {
+                let (then, now) = (identity(*delta), remapped.physical_identity());
+                assert_eq!(retained.physical_identity(), then, "+{delta}");
+                assert_ne!(now.map(|(section, _)| section), then.map(|(section, _)| section));
+                assert_eq!(now.map(|(_, offset)| offset), then.map(|(_, offset)| offset));
+            }
+        }
+        for at in [recorded, alias] {
+            assert_eq!(XMemMapPhysicalPages(at, 2, std::ptr::null()), at);
+        }
+        assert_eq!(XMemFreePhysicalPages(2, replacement.as_ptr()), 1);
+        // The original virtual reservation was split into two placeholders.
+        for at in [recorded, next, alias] {
+            // SAFETY: each placeholder belongs to this test and its views are unmapped.
+            assert_ne!(unsafe { VirtualFree(at, 0, MEM_RELEASE) }, 0);
+        }
     }
 
     #[test]

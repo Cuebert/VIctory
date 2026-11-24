@@ -49,6 +49,20 @@ const fn vop3(op: u16, vdst: u8, src0: u16, src1: u16, src2: u16) -> [u32; 2] {
     ]
 }
 
+/// VOP2 `op vdst, src0, vsrc1` (`src0` as [`vop1`]'s).
+const fn vop2(op: u8, vdst: u8, src0: u16, vsrc1: u8) -> u32 {
+    (op as u32 & 0x3F) << 25 | (vdst as u32) << 17 | (vsrc1 as u32) << 9 | (src0 as u32 & 0x1FF)
+}
+
+/// DS `op` at the LDS byte address `vaddr` + `offset`: a load into `vdst`
+/// or a store of `vdata`.
+const fn ds(op: u8, offset: u16, vdst: u8, vdata: u8, vaddr: u8) -> [u32; 2] {
+    [
+        0x36 << 26 | (op as u32) << 18 | offset as u32,
+        (vdst as u32) << 24 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
 /// MUBUF `buffer_store_dword vdata, off, s[srsrc:srsrc+3], 0 offset:byte_off`.
 const fn buffer_store_dword(vdata: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
     [
@@ -69,6 +83,11 @@ const fn vgpr(n: u8) -> u16 {
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
 fn build_valu_cs(body: &[u32]) -> HostShader {
+    lower_cs(&valu_cs_words(body))
+}
+
+/// The program [`build_valu_cs`] lowers.
+fn valu_cs_words(body: &[u32]) -> Vec<u32> {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -81,13 +100,19 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
     words.extend_from_slice(body);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
-    lower_cs(&words)
+    words
 }
 
 /// Lowers `words` as a 1-thread compute program with [`build_valu_cs`]'s
 /// layout: 4 root constants in `s0..s3`, the address of a table holding a
 /// UAV in `s4`.
 fn lower_cs(words: &[u32]) -> HostShader {
+    lower_cs_group(words, 0, 1)
+}
+
+/// [`lower_cs`] for a group of `threads` threads with `lds` × 512 bytes of
+/// LDS.
+fn lower_cs_group(words: &[u32], lds: u32, threads: u32) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -122,19 +147,30 @@ fn lower_cs(words: &[u32]) -> HostShader {
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: 5 << 1, // 5 user SGPRs: s0..s4
-            threads: [1, 1, 1],
+            // 5 user SGPRs: s0..s4; the LDS size in units of 128 dwords.
+            rsrc2: lds << 15 | 5 << 1,
+            threads: [threads, 1, 1],
         }),
         code,
     };
 
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    lower_test_compute(&native)
+}
+
+fn lower_test_compute(native: &NativeProgram) -> HostShader {
+    let p = ir::build_with(
+        &native.code,
+        native.wave64,
+        native.vgprs,
+        native.spills_root_args(),
+    )
+    .expect("ir::build_with");
     let st = structure::structure(&p).expect("structure");
     let res =
         resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
+    let io = io::raise(&p, native).expect("io::raise");
     let lowered = lower::lower(&lower::Parts {
-        native: &native,
+        native,
         p: &p,
         st: &st,
         io: &io,
@@ -157,6 +193,9 @@ fn lower_cs(words: &[u32]) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        address_map: lowered.address_map,
+        descriptor_words: lowered.descriptor_words,
+        root_uavs: lowered.root_uavs,
     };
 
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
@@ -174,13 +213,21 @@ fn lower_cs(words: &[u32]) -> HostShader {
 fn run_cases(
     shader: &HostShader,
     cases: &[[u32; 4]],
+    check: impl FnMut(&str, usize, [u32; 4], u32),
+) {
+    run_buffer_cases(shader, cases, 1, check);
+}
+
+fn run_buffer_cases(
+    shader: &HostShader,
+    cases: &[[u32; 4]],
+    dwords: u32,
     mut check: impl FnMut(&str, usize, [u32; 4], u32),
 ) {
     // One test at a time: with these tests on the hardware adapter and WARP
     // from several test threads at once, now and then none of their
     // dispatches ever completes and the test binary hangs.
-    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let _one = super::waterfall_tests::one_at_a_time();
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
         let Ok(host) = Host::new(warp) else {
@@ -206,7 +253,7 @@ fn run_cases(
                     &pso,
                     &Dispatch {
                         roots: vec![(0, Root::Constants(ud))],
-                        views: &[View::RawUav(1)],
+                        views: &[View::RawUav(dwords)],
                         samplers: &[],
                         groups: [1, 1, 1],
                     },
@@ -214,6 +261,284 @@ fn run_cases(
                 .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
             check(label, i, inputs, out[0][0]);
         }
+        ran += 1;
+    }
+    assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");
+}
+
+#[test]
+fn raw_short_writes_preserve_adjacent_bytes_and_check_view_end() {
+    let mut body = Vec::new();
+    body.extend(buffer_store_dword(1, 8, 0));
+    body.extend(buffer_store_dword(2, 8, 4));
+    body.extend([0xe068_1000, 0x8002_0304]); // buffer_store_short v3, v4, s[8:11], 0 offen
+    // Read the affected dword, selected by the test through the high half of s2.
+    body.push(0x2c06_0690); // v_lshrrev_b32 v3, 16, v3
+    body.extend([0xe030_1000, 0x8002_0003]); // buffer_load_dword v0, v3, s[8:11], 0 offen
+    let shader = build_valu_cs(&body);
+    let cases = (0..9)
+        .flat_map(|off| [0, 4].map(move |dst| [0x44332211, 0x88776655, (dst << 16) | 0xaabb, off]))
+        .collect::<Vec<_>>();
+    run_buffer_cases(&shader, &cases, 2, |label, _, input, value| {
+        let mut bytes = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        let offset = input[3] as usize;
+        if let Some(dst) = bytes.get_mut(offset..offset + 2) {
+            dst.copy_from_slice(&[0xbb, 0xaa]);
+        }
+        let start = (input[2] >> 16) as usize;
+        assert_eq!(
+            value,
+            u32::from_le_bytes(bytes[start..start + 4].try_into().unwrap()),
+            "{label}: offset {offset}, dword at {start}"
+        );
+    });
+}
+
+#[test]
+fn raw_ushort_reads_both_halves_and_checks_view_end() {
+    let mut body = Vec::new();
+    body.extend(buffer_store_dword(1, 8, 0));
+    body.extend(buffer_store_dword(2, 8, 4));
+    body.extend([0xe028_1000, 0x8002_0004]); // buffer_load_ushort v0, v4, s[8:11], 0 offen
+    let shader = build_valu_cs(&body);
+    let cases = (0..9)
+        .map(|offset| [0x44332211, 0x88776655, 0, offset])
+        .collect::<Vec<_>>();
+    let expected = [0x2211, 0x3322, 0x4433, 0x5544, 0x6655, 0x7766, 0x8877, 0, 0];
+    run_buffer_cases(&shader, &cases, 2, |label, i, _, value| {
+        assert_eq!(value, expected[i], "{label}: byte offset {i}");
+    });
+}
+
+/// `ds_read_u16` and `ds_read_i16` at a halfword-aligned address plus the
+/// literal offset of the shadow-mask denoiser's loads (80): the half the
+/// address names, of the dword that holds it, up to the last halfword of the
+/// allocation, and nothing from past it.
+#[test]
+fn lds_halfword_loads_read_the_addressed_half_inside_the_allocation() {
+    // B in one dword of LDS and A in the next, by dword stores; then the load
+    // at 2 * s1 + 80 (the shift proves the address halfword-aligned).
+    const A: u32 = 0x1234_ABCD;
+    const B: u32 = 0x5678_9EF0;
+    // (byte address of B's dword, address register, the half 80 bytes on)
+    let cases: [(u32, u32, Option<u16>); 8] = [
+        (80, 0, Some(0x9EF0)),    // the literal offset alone: B's low half
+        (80, 2, Some(0x5678)),    // B's high half
+        (80, 4, Some(0xABCD)),    // the next dword: A's low half
+        (80, 6, Some(0x1234)),    // A's high half
+        (504, 428, Some(0xABCD)), // byte 508
+        (504, 430, Some(0x1234)), // byte 510: the last halfword of the 512 bytes
+        (504, 432, None),         // byte 512: past the allocation, reads 0
+        (0, 0xFFFF_FFB6, None),   // 2^32 + 6: not wrapped onto A's high half
+    ];
+    let inputs: Vec<[u32; 4]> = cases
+        .iter()
+        .map(|&(at, reg, _)| [A, reg >> 1, at, B])
+        .collect();
+    for (name, op) in [("ds_read_u16", 0x3C), ("ds_read_i16", 0x3B)] {
+        let mut body = Vec::new();
+        body.extend(ds(0x0D, 0, 0, 4, 3)); // ds_write_b32 v3, v4
+        body.extend(ds(0x0D, 4, 0, 1, 3)); // ds_write_b32 v3, v1 offset:4
+        body.push(vop2(0x1A, 5, 129, 2)); // v_lshlrev_b32 v5, 1, v2
+        body.extend(ds(op, 80, 0, 0, 5)); // ds_read_u16 / ds_read_i16 v0, v5 offset:80
+        // 64 threads (two console waves), each storing and loading the same
+        // values: a group of one wave with LDS is lowered with the console's
+        // wave size declared, and an adapter that does not run 32-lane waves
+        // would refuse that pipeline.
+        let shader = lower_cs_group(&valu_cs_words(&body), 1, 64);
+        run_cases(&shader, &inputs, |label, i, _, got| {
+            let (_, reg, half) = cases[i];
+            let want = match half {
+                None => 0,
+                Some(h) if op == 0x3B => h as i16 as u32,
+                Some(h) => u32::from(h),
+            };
+            assert_eq!(
+                got, want,
+                "{label}: {name} at {reg:#x} + 80 = {got:#x}, want {want:#x}"
+            );
+        });
+    }
+}
+
+#[test]
+fn mapped_float_extents_respect_bits_and_write_permissions() {
+    use super::address_map::{self, READ, Range, WRITE};
+    let words = [
+        vop1(1, 4, sgpr(1)),
+        vop1(1, 5, sgpr(2)),
+        vop1(1, 6, sgpr(3)),
+        0xdcfc_8000,
+        0x007d_0604, // global_atomic_fmin v[4:5], v6, off
+        0xdd00_8004,
+        0x007d_0604, // global_atomic_fmax v[4:5], v6, off offset:4
+        S_ENDPGM,
+    ];
+    let shader = lower_cs(&words);
+    assert!(shader.address_map);
+    const VA: u64 = 0x0110_0000_0100;
+    let _one = super::waterfall_tests::one_at_a_time();
+    let mut adapters = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else { continue };
+        let (root, pso) = host.compute_pipeline(&shader).unwrap();
+        for (seed, source) in [
+            (1f32.to_bits(), (-2.0f32).to_bits()),
+            (0x80000000, 0),
+            (0, 0x80000000),
+            (1, 0x80000001),
+            (0x7f800000, 0xff800000),
+            (0xff800000, 0x7f800000),
+            (0x7fc12345, 7),
+            (7, 0x7fc45678),
+        ] {
+            for (access, offset, len) in [
+                (READ | WRITE, 0, 8),
+                (READ, 0, 8),
+                (WRITE, 0, 8),
+                (READ | WRITE, 1, 8),
+                (READ | WRITE, 0, 4),
+            ] {
+                let map = address_map::encode(&[Range {
+                    start: VA,
+                    len,
+                    view: 0,
+                    view_offset: 4,
+                    access,
+                }]);
+                let addr = VA + offset;
+                let inputs = [0, addr as u32, (addr >> 32) as u32, source];
+                let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+                for u in &shader.user_data {
+                    ud[u.index as usize] = match u.root {
+                        RootType::Constants => inputs[u.dword as usize],
+                        root => super::host::guard(root, 1, 0).unwrap(),
+                    };
+                }
+                let data = [0x1ea023cd, seed, seed, 0x1ea023cd];
+                let out = host
+                    .dispatch(
+                        &root,
+                        &pso,
+                        &Dispatch {
+                            roots: vec![
+                                (0, Root::Constants(ud)),
+                                (
+                                    1,
+                                    Root::View {
+                                        srv: true,
+                                        data: map,
+                                    },
+                                ),
+                            ],
+                            views: &[View::RawData(&data)],
+                            samplers: &[],
+                            groups: [1, 1, 1],
+                        },
+                    )
+                    .unwrap();
+                let mut expected = data;
+                if access == READ | WRITE && offset == 0 {
+                    if f32::from_bits(source) < f32::from_bits(seed) {
+                        expected[1] = source;
+                    }
+                    if len >= 8 && f32::from_bits(source) > f32::from_bits(seed) {
+                        expected[2] = source;
+                    }
+                }
+                assert_eq!(
+                    out[0], expected,
+                    "{label} seed={seed:#x} src={source:#x} perm={access} offset={offset} len={len}"
+                );
+            }
+        }
+        adapters += 1;
+        eprintln!(
+            "{label}: 40 exact FP min/max cases including denied, misaligned and truncated mappings"
+        );
+    }
+    assert!(adapters > 0);
+}
+
+#[test]
+fn compute_writes_through_spilled_root_uav() {
+    let slot = 3;
+    let [store, store_operands] = buffer_store_dword(0, 8, 4);
+    let words = [
+        0xF404_0200, // s_load_dwordx2 s[8:9], s[0:1], 0
+        0xFA00_0000,
+        s_mov_b32(10, 0x84),  // descriptor size
+        s_mov_b32(11, 0x80),  // remaining descriptor flags
+        vop1(0x001, 0, 0x9D), // v_mov_b32 v0, 29
+        store,
+        store_operands,
+        S_ENDPGM,
+    ];
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 1,
+        layout: vec![RootParam {
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            sgprs: 2,
+            base_register: 0,
+            user_data: 16,
+            slot,
+        }],
+        used: vec![UsedResource {
+            kind: ResourceType::Uav,
+            root: RootType::Descriptor,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 4,
+            user_data: 16,
+            slot,
+        }],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 4 << 1,
+            threads: [1, 1, 1],
+        }),
+        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+    };
+    assert!(native.spills_root_args());
+    let shader = lower_test_compute(&native);
+    assert_eq!(shader.root_uavs, [slot]);
+
+    let _one = super::waterfall_tests::one_at_a_time();
+    let mut ran = 0;
+    for (label, warp) in [("hardware", false), ("warp", true)] {
+        let Ok(host) = Host::new(warp) else {
+            eprintln!("no SM 6.6 {label} device; skipped");
+            continue;
+        };
+        let (root, pso) = host
+            .compute_pipeline(&shader)
+            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
+        let out = host
+            .dispatch(
+                &root,
+                &pso,
+                &Dispatch {
+                    roots: vec![
+                        (0, Root::Constants(vec![0])),
+                        (
+                            1,
+                            Root::Table {
+                                sampler: false,
+                                index: 1,
+                            },
+                        ),
+                    ],
+                    views: &[View::RawUav(4), View::RawUav(4)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
+        assert_eq!(out, [vec![0; 4], vec![0, 29, 0, 0]], "{label}");
+        eprintln!("{label}: root UAV write verified");
         ran += 1;
     }
     assert!(ran > 0, "neither hardware nor WARP SM 6.6 device available");

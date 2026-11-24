@@ -821,9 +821,38 @@ fn place<'a>(
 pub(crate) struct Memory {
     ptr: NonNull<u8>,
     layout: Layout,
+    owned: Option<std::sync::Arc<OwnedAllocation>>,
     /// Set when the memory came from the title's allocator, with these
     /// allocation attributes (it goes back there).
     attributes: Option<u64>,
+}
+
+/// Retains only allocations made by this runtime. A raw address or a title
+/// allocator callback cannot create this capability.
+pub(crate) struct OwnedAllocation {
+    ptr: NonNull<u8>,
+    layout: Layout,
+}
+
+// SAFETY: this type only owns the allocation. It exposes no reference to its
+// contents, and the system allocator permits deallocation on another thread.
+unsafe impl Send for OwnedAllocation {}
+// SAFETY: ownership/lifetime are immutable and access to bytes is external.
+unsafe impl Sync for OwnedAllocation {}
+
+impl Drop for OwnedAllocation {
+    fn drop(&mut self) {
+        // SAFETY: allocated by alloc_zeroed with exactly this layout.
+        unsafe { dealloc(self.ptr.as_ptr(), self.layout) };
+    }
+}
+
+impl OwnedAllocation {
+    pub(crate) fn contains(&self, start: usize, len: usize) -> bool {
+        let base = self.ptr.as_ptr() as usize;
+        len > 0 && start >= base && start.checked_sub(base)
+            .and_then(|offset| offset.checked_add(len)).is_some_and(|end| end <= self.layout.size())
+    }
 }
 
 pub type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
@@ -854,6 +883,82 @@ pub(crate) fn page_mapper() -> Option<PageMapper> {
     PAGE_MAPPER.get().copied()
 }
 
+/// Snapshots resident bytes from registered title physical pages. Returned
+/// intervals index the destination in ascending order; gaps remain untouched.
+pub type TexturePageReader = fn(usize, &mut [u8]) -> Vec<(usize, usize)>;
+pub(crate) static TEXTURE_PAGE_READER: std::sync::OnceLock<TexturePageReader> =
+    std::sync::OnceLock::new();
+
+pub fn use_texture_page_reader(reader: TexturePageReader) {
+    let _ = TEXTURE_PAGE_READER.set(reader);
+}
+
+/// An exact byte range in backing storage retained by the memory provider.
+/// The caller can publish one complete shader output through this capability.
+pub trait RetainedSectionOutput: Send + Sync {
+    fn store(&self, bytes: &[u8]) -> bool;
+    #[cfg(feature="diagnostics")]
+    fn physical_identity(&self) -> Option<(u64,u64)> {None}
+}
+
+type SectionOutputRetainer = fn(u64, usize) -> Option<std::sync::Arc<dyn RetainedSectionOutput>>;
+static SECTION_OUTPUT: std::sync::OnceLock<SectionOutputRetainer> = std::sync::OnceLock::new();
+
+pub fn use_section_output_retainer(retain: SectionOutputRetainer) {
+    let _ = SECTION_OUTPUT.set(retain);
+}
+
+pub(crate) fn retain_section_output(address: u64, len: usize) -> Option<std::sync::Arc<dyn RetainedSectionOutput>> {
+    SECTION_OUTPUT.get()?(address, len)
+}
+
+/// Counts registered physical bytes in each (start, byte length) span.
+/// This reports XMem mapping metadata to diagnostics and grants no access.
+#[cfg(feature = "diagnostics")]
+type SectionCoverage = fn(&[(u64, u64)]) -> Vec<u64>;
+#[cfg(feature = "diagnostics")]
+static SECTION_COVERAGE: std::sync::OnceLock<SectionCoverage> = std::sync::OnceLock::new();
+
+#[cfg(feature = "diagnostics")]
+pub fn use_section_coverage(reader: fn(&[(u64, u64)]) -> Vec<u64>) {
+    let _ = SECTION_COVERAGE.set(reader);
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn section_coverage(spans: &[(u64, u64)]) -> Option<Vec<u64>> {
+    SECTION_COVERAGE.get().map(|coverage| coverage(spans))
+}
+
+#[cfg(feature = "diagnostics")]
+type AllocationHistory = fn(u64, u64) -> String;
+#[cfg(feature = "diagnostics")]
+type AsIdentity = fn(u64, u64) -> Option<(u8, u64, u64)>;
+#[cfg(feature = "diagnostics")]
+static AS_IDENTITY: std::sync::OnceLock<AsIdentity> = std::sync::OnceLock::new();
+#[cfg(feature = "diagnostics")]
+pub fn use_as_identity(f: AsIdentity) { let _ = AS_IDENTITY.set(f); }
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn as_range_identity(start:u64, size:u64) -> Option<(u8,u64,u64)> {
+    // A physical alias has one identity across VA mappings. For ordinary owned
+    // buffers prefer a live registration to a historical reservation.
+    let xmem=AS_IDENTITY.get().and_then(|f| f(start,size));
+    if xmem.is_some_and(|v|v.0==1) { return xmem; }
+    crate::shadow::owned_identity(start,size).or(xmem)
+}
+
+#[cfg(feature = "diagnostics")]
+static ALLOCATION_HISTORY: std::sync::OnceLock<AllocationHistory> = std::sync::OnceLock::new();
+
+#[cfg(feature = "diagnostics")]
+pub fn use_allocation_history(reader: fn(u64, u64) -> String) {
+    let _ = ALLOCATION_HISTORY.set(reader);
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn allocation_history(start: u64, size: u64) -> Option<String> {
+    ALLOCATION_HISTORY.get().map(|describe| describe(start, size))
+}
+
 /// Allocation attributes for resource memory: allocator id, page size
 /// (bits 14-15: 2 MiB pages from 2 MiB up, else 64 KiB), alignment as log2
 /// (bits 24-28) and memory type (bits 29-32: write-combined for GPU-only
@@ -870,6 +975,15 @@ fn resource_attributes(info: AllocationInfo, heap_kind: u32) -> u64 {
 }
 
 impl Memory {
+    #[cfg(windows)]
+    pub(crate) fn map_owner(&self, offset: u64, bytes: u64) -> Option<std::sync::Arc<OwnedAllocation>> {
+        let end = offset.checked_add(bytes)?;
+        if bytes == 0 || end > self.layout.size() as u64 {
+            return None;
+        }
+        self.owned.clone()
+    }
+
     /// A committed resource's memory: from the title's allocator if the
     /// runtime named one, else our own; zeroed either way.
     fn for_resource(info: AllocationInfo, heap_kind: u32) -> Result<Memory, HRESULT> {
@@ -886,6 +1000,7 @@ impl Memory {
         Ok(Memory {
             ptr,
             layout,
+            owned: None,
             attributes: Some(attributes),
         })
     }
@@ -911,6 +1026,7 @@ impl Memory {
         Ok(Memory {
             ptr,
             layout,
+            owned: Some(std::sync::Arc::new(OwnedAllocation { ptr, layout })),
             attributes: None,
         })
     }
@@ -918,10 +1034,8 @@ impl Memory {
 
 impl Drop for Memory {
     fn drop(&mut self) {
-        match (self.attributes, ALLOCATOR.get()) {
-            (Some(attributes), Some(&(_, free))) => free(self.ptr.as_ptr().cast(), attributes),
-            // SAFETY: allocated in `new` with this layout.
-            _ => unsafe { dealloc(self.ptr.as_ptr(), self.layout) },
+        if let (Some(attributes), Some(&(_, free))) = (self.attributes, ALLOCATOR.get()) {
+            free(self.ptr.as_ptr().cast(), attributes);
         }
     }
 }
@@ -1237,12 +1351,13 @@ fn host_twin(
 }
 
 /// A texture's console memory and description; `None` for buffers.
-pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
+pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc, bool)> {
     if this.is_null() {
         return None;
     }
     let r = resource(this);
-    (r.desc.dimension != BUFFER).then(|| (r.data().cast_const(), r.desc))
+    (r.desc.dimension != BUFFER)
+        .then(|| (r.data().cast_const(), r.desc, matches!(r.backing, Backing::Address(_))))
 }
 
 /// A buffer's host memory and size; `None` for textures.
@@ -1323,7 +1438,22 @@ fn hand_out_resource(
     #[cfg(windows)]
     if desc.dimension == BUFFER {
         let at = std::ptr::from_ref::<Resource>(&resource) as usize;
-        crate::shadow::register(at, resource.data() as u64, desc.width);
+        let (memory, offset) = match &resource.backing {
+            Backing::Committed(memory) => (Some(memory), 0),
+            // SAFETY: a placed resource holds its heap alive.
+            Backing::Placed { heap, offset } => {
+                (Some(unsafe { &(*heap.cast::<Heap>()).memory }), *offset)
+            }
+            Backing::Address(_) => (None, 0),
+        };
+        let owner = memory.and_then(|m| m.map_owner(offset, desc.width));
+        let origin = match &resource.backing {
+            Backing::Committed(memory) if memory.owned.is_some() => crate::shadow::BufferOrigin::Runtime,
+            Backing::Committed(_) => crate::shadow::BufferOrigin::Allocator,
+            Backing::Placed { .. } => crate::shadow::BufferOrigin::Heap,
+            Backing::Address(_) => crate::shadow::BufferOrigin::TitleAddress,
+        };
+        crate::shadow::register(at, resource.data() as u64, desc.width, owner, desc.flags, origin);
     }
     object::hand_out(RESOURCE, resource, iid, &RESOURCE_IIDS, out)
 }
@@ -1727,6 +1857,18 @@ static RESOURCE_FUNCTIONS: Table<32> = {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn registered_map_retains_the_final_dword_of_a_runtime_allocation() {
+        let memory = super::Memory::zeroed(64, 16).unwrap();
+        let owner = memory.map_owner(60, 4).expect("last aligned dword");
+        let weak = std::sync::Arc::downgrade(&owner);
+        drop(memory);
+        assert!(weak.upgrade().is_some());
+        drop(owner);
+        assert!(weak.upgrade().is_none());
+    }
+
     use super::*;
     use crate::object::slot;
 
@@ -2555,6 +2697,881 @@ void main(uint3 id : SV_DispatchThreadID) {
                     "texel ({x}, {y}): {got:#x}, wanted {value} ({wanted:#x})"
                 );
             }
+        }
+    }
+
+    /// Optional local probe of the exact title program, driven through normal
+    /// command recording and the registered resource's fence and copy-back path.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "supply the locally verified ResetCounterValues container on stdin"]
+    fn actual_builder_resets_only_the_requested_counters() {
+        use std::io::Read;
+        let mut input = Vec::new();
+        std::io::stdin().take(4073).read_to_end(&mut input).unwrap();
+        assert_eq!(input.len(), 4072);
+        assert_eq!(&blake3::hash(&input).to_hex()[..16], "3b90165a77d95cdf");
+        #[repr(C)]
+        struct ComputeDescription {
+            root: This,
+            code: *const u8,
+            bytes: usize,
+        }
+        let null = std::ptr::null();
+        let description = ComputeDescription {
+            root: null,
+            code: input.as_ptr(),
+            bytes: input.len(),
+        };
+        let mut pipeline = null;
+        assert_eq!(
+            crate::pipeline::create_compute(
+                null,
+                (&raw const description).cast(),
+                &PAGEABLE_IIDS[0],
+                &mut pipeline
+            ),
+            S_OK
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let pso = loop {
+            if let Some(p) = crate::pipeline::host_pipeline(pipeline) {
+                break p;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "compute PSO unavailable"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        let stage = &pso.stages[0].translated().host;
+        assert_eq!(stage.root_uavs, [1]);
+        assert!(
+            !stage.address_map,
+            "this program needs only the bounded root UAV"
+        );
+        let mut out = null;
+        let mut desc = buffer(256);
+        desc.flags = 4;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &desc,
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut out
+            ),
+            S_OK
+        );
+        let (data, bytes) = buffer_bytes(out).unwrap();
+        assert_eq!(bytes, 256);
+        unsafe { std::slice::from_raw_parts_mut(data.cast::<u32>(), 64) }.fill(0x620d0a2b);
+        let root = data as u64 + 16;
+        let heap = crate::descriptor::test_view_heap(16);
+        let host = crate::host::host().unwrap();
+        let list = host.new_list().unwrap();
+        let mut state = crate::draw::State::default();
+        state.set_pipeline(pipeline);
+        state.set_heaps(&[heap]);
+        state.set_view(true, 1, root);
+        for u in &stage.user_data {
+            assert_eq!(u.root, victory_shader::RootType::Constants);
+            let val = match u.index {
+                21 => 2,
+                22 => 0xa54cc993,
+                _ => 0,
+            };
+            state.set_constants(true, u32::from(u.slot), &[val], u.dword);
+        }
+        state.dispatch(&list, 1, 1, 1);
+        list.close();
+        host.execute(&[&list]);
+        let words = unsafe { std::slice::from_raw_parts(data.cast::<u32>(), 64) };
+        for (i, word) in words.iter().enumerate() {
+            assert_eq!(
+                *word,
+                if (4..12).contains(&i) {
+                    0xa54cc993
+                } else {
+                    0x620d0a2b
+                },
+                "word {i}"
+            );
+        }
+        eprintln!(
+            "ResetCounterValues: 8 destination dwords changed, 56 sentinel dwords preserved; one group; registered UAV+16"
+        );
+        drop(state);
+        drop(list);
+        crate::object::release(heap);
+        crate::object::release(out);
+        crate::object::release(pipeline);
+    }
+
+    /// One compressed lane references a real, nondegenerate triangle in the
+    /// same owned allocation. The other 63 headers describe empty nodes.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "supply a local Box16Rehydration or Box32Rehydration container on stdin"]
+    fn actual_builder_rehydrates_one_triangle_box() {
+        use std::io::Read;
+        let mut input = Vec::new();
+        std::io::stdin()
+            .take(11841)
+            .read_to_end(&mut input)
+            .unwrap();
+        let hash = blake3::hash(&input).to_hex();
+        let small = match (&hash[..16], input.len()) {
+            ("caa78b8ca62bc3d6", 11840) => true,
+            ("28918b7150a7aad5", 11052) => false,
+            _ => panic!("unrecognized box builder"),
+        };
+        #[repr(C)]
+        struct ComputeDescription {
+            root: This,
+            code: *const u8,
+            bytes: usize,
+        }
+        let null = std::ptr::null();
+        let desc = ComputeDescription {
+            root: null,
+            code: input.as_ptr(),
+            bytes: input.len(),
+        };
+        let mut pso = null;
+        assert_eq!(
+            crate::pipeline::create_compute(
+                null,
+                (&raw const desc).cast(),
+                &PAGEABLE_IIDS[0],
+                &mut pso
+            ),
+            S_OK
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let stage = loop {
+            if let Some(p) = crate::pipeline::host_pipeline(pso) {
+                break &p.stages[0].translated().host;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "real box PSO unavailable"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        let mut slots = stage.root_uavs.clone();
+        slots.sort_unstable();
+        assert_eq!(slots, [1, 2]);
+        assert!(!stage.address_map);
+        let mut resource = null;
+        let mut desc = buffer(32768);
+        desc.flags = 4;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &desc,
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut resource
+            ),
+            S_OK
+        );
+        let (data, bytes) = buffer_bytes(resource).unwrap();
+        let root = data as u64 + 16;
+        let leaf = 0x6000usize;
+        let node = 0x0400usize;
+        let child = (leaf / 8) as u32;
+        let triangle = [-2.0f32, 3.0, -4.0, 5.0, -7.0, 2.0, 1.0, 4.0, 8.0].map(f32::to_bits);
+        {
+            let arr =
+                unsafe { std::slice::from_raw_parts_mut(data.cast::<u32>(), bytes as usize / 4) };
+            arr.fill(0xad35beef);
+            let words = &mut arr[4..];
+            words[node / 4..node / 4 + 68].fill(0);
+            words[node / 4] = 1 << 24; // first lane supplies one child, zero explicit bound overrides
+            words[node / 4 + 64] = child;
+            words[leaf / 4..leaf / 4 + 16].fill(0);
+            words[leaf / 4..leaf / 4 + 9].copy_from_slice(&triangle);
+        }
+        let heap = crate::descriptor::test_view_heap(16);
+        let host = crate::host::host().unwrap();
+        let list = host.new_list().unwrap();
+        let mut state = crate::draw::State::default();
+        state.set_pipeline(pso);
+        state.set_heaps(&[heap]);
+        state.set_view(true, 1, root);
+        state.set_view(true, 2, root);
+        for u in &stage.user_data {
+            assert_eq!(u.root, victory_shader::RootType::Constants);
+            let value = if u.dword == 0 { node as u32 } else { 0 };
+            state.set_constants(true, u32::from(u.slot), &[value], u.dword);
+        }
+        state.dispatch(&list, 1, 1, 1);
+        list.close();
+        host.execute(&[&list]);
+        let arr = unsafe { std::slice::from_raw_parts(data.cast::<u32>(), bytes as usize / 4) };
+        let words = &arr[4..];
+        let start = node / 4;
+        eprintln!(
+            "builder {} first node: {:x?}",
+            &hash[..16],
+            &words[start..start + 16]
+        );
+        assert_eq!(&arr[..4], &[0xad35beef; 4]);
+        assert_eq!(words[0x5000 / 4], 0xad35beef);
+        assert_eq!(&words[leaf / 4..leaf / 4 + 9], &triangle);
+        assert_eq!(
+            &words[start..start + 4],
+            &[child, u32::MAX, u32::MAX, u32::MAX]
+        );
+        if small {
+            assert_eq!(
+                &words[start + 4..start + 7],
+                &[0xc700c000, 0x4500c400, 0x48004400]
+            );
+        } else {
+            assert_eq!(
+                &words[start + 4..start + 10],
+                &[-2.0f32, -7.0, -4.0, 5.0, 4.0, 8.0].map(f32::to_bits)
+            );
+        }
+        let next = start + if small { 16 } else { 32 };
+        assert_eq!(&words[next..next + 4], &[u32::MAX; 4]);
+        eprintln!(
+            "one real child pointer; six triangle-derived AABB coordinates, empty neighbor, source triangle and sentinels verified"
+        );
+        drop(state);
+        drop(list);
+        crate::object::release(heap);
+        crate::object::release(resource);
+        crate::object::release(pso);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "supply the local CalculateMortonCodes container on stdin"]
+    fn actual_builder_calculates_three_spatial_codes() {
+        use std::io::Read;
+        let mut input = Vec::new();
+        std::io::stdin()
+            .take(13217)
+            .read_to_end(&mut input)
+            .unwrap();
+        assert_eq!(input.len(), 13216);
+        assert_eq!(&blake3::hash(&input).to_hex()[..16], "6f6a359d1166bb27");
+        #[repr(C)]
+        struct Description {
+            root: This,
+            code: *const u8,
+            bytes: usize,
+        }
+        let null = std::ptr::null();
+        let desc = Description {
+            root: null,
+            code: input.as_ptr(),
+            bytes: input.len(),
+        };
+        let mut pipeline = null;
+        assert_eq!(
+            crate::pipeline::create_compute(
+                null,
+                (&raw const desc).cast(),
+                &PAGEABLE_IIDS[0],
+                &mut pipeline
+            ),
+            S_OK
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let stage = loop {
+            if let Some(p) = crate::pipeline::host_pipeline(pipeline) {
+                break &p.stages[0].translated().host;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "Morton PSO unavailable"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        assert!(stage.address_map);
+        let mut slots = stage.root_uavs.clone();
+        slots.sort_unstable();
+        assert_eq!(slots, [1, 2, 3, 4]);
+        let mut resource = null;
+        let mut desc = buffer(8192);
+        desc.flags = 4;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &desc,
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut resource
+            ),
+            S_OK
+        );
+        let (data, bytes) = buffer_bytes(resource).unwrap();
+        const HEADER: usize = 0x100;
+        const INDICES: usize = 0x400;
+        const KEYS: usize = 0x600;
+        const BOXES: usize = 0x800;
+        const EXTENT: usize = 0xc00;
+        let sentinel = 0x31b29eea;
+        let before = {
+            let words =
+                unsafe { std::slice::from_raw_parts_mut(data.cast::<u32>(), bytes as usize / 4) };
+            words.fill(sentinel);
+            words[(HEADER + 64) / 4] = 0;
+            words[(HEADER + 80) / 4] = 3;
+            // Three non-overlapping 24-byte records, each holding a point AABB.
+            for (i, p) in [0.0f32, 4.0, 8.0].into_iter().enumerate() {
+                words[BOXES / 4 + i * 6..BOXES / 4 + (i + 1) * 6].fill(p.to_bits());
+            }
+            words[EXTENT / 4..EXTENT / 4 + 6]
+                .copy_from_slice(&[0.0f32, 0.0, 0.0, 8.0, 8.0, 8.0].map(f32::to_bits));
+            words.to_vec()
+        };
+        let base = data as u64;
+        let header = base + HEADER as u64;
+        let heap = crate::descriptor::test_view_heap(128);
+        let host = crate::host::host().unwrap();
+        let list = host.new_list().unwrap();
+        let mut state = crate::draw::State::default();
+        state.set_pipeline(pipeline);
+        state.set_heaps(&[heap]);
+        state.set_constants(
+            true,
+            0,
+            &[header as u32, (header >> 32) as u32, 0, 0, 3, 0, 0, 0],
+            0,
+        );
+        for (slot, at) in [(1, INDICES), (2, KEYS), (3, BOXES), (4, EXTENT)] {
+            state.set_view(true, slot, base + at as u64);
+        }
+        state.dispatch(&list, 1, 1, 1);
+        list.close();
+        host.execute(&[&list]);
+        let words = unsafe { std::slice::from_raw_parts(data.cast::<u32>(), bytes as usize / 4) };
+        eprintln!(
+            "Morton indices {:x?}, codes {:x?}",
+            &words[INDICES / 4..INDICES / 4 + 4],
+            &words[KEYS / 4..KEYS / 4 + 4]
+        );
+        assert_eq!(&words[INDICES / 4..INDICES / 4 + 3], &[0, 1, 2]);
+        assert_eq!(&words[KEYS / 4..KEYS / 4 + 3], &[0, 0x38000000, 0x3fffffff]);
+        for (i, (a, b)) in before.iter().zip(words).enumerate() {
+            if !(INDICES / 4..INDICES / 4 + 3).contains(&i)
+                && !(KEYS / 4..KEYS / 4 + 3).contains(&i)
+            {
+                assert_eq!(a, b, "unexpected write at {i}");
+            }
+        }
+        drop(state);
+        drop(list);
+        crate::object::release(heap);
+        crate::object::release(resource);
+        crate::object::release(pipeline);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "supply local ResetCounterValues on stdin and VICTORY_RETAINED_RESET=1"]
+    fn reset_section_dispatch_and_replay_keep_the_recorded_physical_destination() {
+        use std::io::Read;
+        use std::sync::{Arc, Mutex};
+        assert!(crate::section_reset::enabled());
+        type Section = Arc<Mutex<Vec<u8>>>;
+        static BINDING: Mutex<Option<(u64, usize, Section)>> = Mutex::new(None);
+        struct Lease(Section, usize, usize);
+        impl RetainedSectionOutput for Lease {
+            fn store(&self, data: &[u8]) -> bool {
+                if data.len() != self.2 {
+                    return false;
+                }
+                self.0.lock().unwrap()[self.1..self.1 + self.2].copy_from_slice(data);
+                true
+            }
+        }
+        fn retain(address: u64, len: usize) -> Option<Arc<dyn RetainedSectionOutput>> {
+            let m = BINDING.lock().unwrap();
+            let (start, end, section) = m.as_ref()?;
+            let offset = usize::try_from(address.checked_sub(*start)?).ok()?;
+            (len > 0 && offset.checked_add(len)? <= *end)
+                .then(|| Arc::new(Lease(section.clone(), offset, len)) as _)
+        }
+        use_section_output_retainer(retain);
+        let mut input = Vec::new();
+        std::io::stdin().take(4073).read_to_end(&mut input).unwrap();
+        assert_eq!(
+            blake3::hash(&input).to_hex().as_str(),
+            "3b90165a77d95cdff2246325555a2f32d5c1fa18e0d227d9e9745a11bf25e4fb"
+        );
+        #[repr(C)]
+        struct Description {
+            root: This,
+            code: *const u8,
+            bytes: usize,
+        }
+        let null = std::ptr::null();
+        let desc = Description {
+            root: null,
+            code: input.as_ptr(),
+            bytes: input.len(),
+        };
+        let mut pso = null;
+        assert_eq!(
+            crate::pipeline::create_compute(
+                null,
+                (&raw const desc).cast(),
+                &PAGEABLE_IIDS[0],
+                &mut pso
+            ),
+            S_OK
+        );
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while crate::pipeline::host_pipeline(pso).is_none() {
+            assert!(std::time::Instant::now() < until);
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let mut virtual_bytes = vec![0xedu8; 131072];
+        let guest = (virtual_bytes.as_mut_ptr() as u64).next_multiple_of(65536);
+        let register = |start, sz, flags| {
+            let mut r = null;
+            let mut d = buffer(sz);
+            d.flags = flags;
+            assert_eq!(
+                create_at_address(null, start, &d, 0, null.cast(), &RESOURCE_IIDS[0], &mut r),
+                S_OK
+            );
+            r
+        };
+        let offset = std::env::var("VICTORY_TEST_RESET_OFFSET").map_or(16, |v| v.parse::<usize>().unwrap());
+        assert!(matches!(offset,4|8|12|16));
+        let destination=guest+offset as u64;
+        let resource = register(guest, 65536, 4);
+        let a = Arc::new(Mutex::new(vec![0xa5; 560]));
+        let b = Arc::new(Mutex::new(vec![0xb6; 560]));
+        *BINDING.lock().unwrap() = Some((guest, 48, a.clone()));
+        let heap = crate::descriptor::test_view_heap(128);
+        let host = crate::host::host().unwrap();
+        let list = host.new_list().unwrap();
+        let mut state = crate::draw::State::default();
+        state.set_pipeline(pso);
+        state.set_heaps(&[heap]);
+        state.set_view(true, 1, destination);
+        state.set_constants(true, 2, &[42], 2); // count has never been defined
+        state.dispatch(&list, 1, 1, 1);
+        state.set_constants(true, 2, &[3, 0x11223344], 1); // section is 16 bytes too short
+        state.dispatch(&list, 1, 1, 1);
+        state.set_constants(true, 2, &[2, 0x11223344], 1);
+        let overlapping = register(guest + 32, 16, 4);
+        state.dispatch(&list, 1, 1, 1);
+        assert_eq!(slot::<Release>(overlapping, 0x10)(overlapping), 0);
+        state.dispatch(&list, 0, 1, 1);
+        list.close();
+        host.execute(&[&list]);
+        assert!(a.lock().unwrap().iter().all(|&x| x == 0xa5));
+        let list = host.new_list().unwrap();
+        let mut state = crate::draw::State::default();
+        state.set_pipeline(pso);
+        state.set_heaps(&[heap]);
+        state.set_view(true, 1, destination);
+        state.set_constants(true, 2, &[2, 0x11223344], 1);
+        let source=crate::shadow::find(destination,32).unwrap();
+        let (initial,init_ptr)=host.shared_buffer(40).unwrap();
+        unsafe {std::ptr::write_bytes(init_ptr,0x73,40);}
+        list.buffer_state(&initial,crate::host::BUFFER_READ);
+        list.buffer_state(&source.buffer,windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COPY_DEST.0 as u32);
+        unsafe {list.list.CopyBufferRegion(&source.buffer,source.offset(destination-4),&initial,0,40);}
+        state.dispatch(&list, 1, 1, 1);
+        // A later GPU reader resolves the very same registered shadow. The
+        // logical VA is remapped below before the closed list ever executes.
+        let source = crate::shadow::find(destination, 32).unwrap();
+        assert!(
+            crate::shadow::section_output(destination, 32).is_some(),
+            "expected complete registered section"
+        );
+        source.refresh(&list, destination, 32);
+        let (mirror, cpu) = host.shared_buffer(65536).unwrap();
+        list.buffer_state(&source.buffer, crate::host::BUFFER_READ);
+        list.buffer_state(
+            &mirror,
+            windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_STATE_COPY_DEST.0 as u32,
+        );
+        unsafe {
+            list.list
+                .CopyBufferRegion(&mirror, 0, &source.buffer, source.offset(destination-4), 40);
+        }
+        list.close();
+        drop(state);
+        assert_eq!(slot::<Release>(resource, 0x10)(resource), 0);
+        *BINDING.lock().unwrap() = Some((guest, 544, b.clone()));
+        let read_only = register(guest, 65536, 0);
+        assert!(crate::shadow::section_output(destination, 32).is_none());
+        assert_eq!(slot::<Release>(read_only, 0x10)(read_only), 0);
+        let replacement = register(guest, 65536, 4);
+        host.execute(&[&list]);
+        let check = |section: &Section, prior: u8, begin: usize, len: usize, word: u32| {
+            for (i, &v) in section.lock().unwrap().iter().enumerate() {
+                let expected = if (begin..begin + len).contains(&i) {
+                    word.to_le_bytes()[(i - begin) % 4]
+                } else {
+                    prior
+                };
+                assert_eq!(v, expected, "byte {i}");
+            }
+        };
+        check(&a, 0xa5, offset, 32, 0x11223344);
+        check(&b, 0xb6, 0, 0, 0);
+        {
+            // Dropping a recorded list before submission cannot publish.
+            let unused = host.new_list().unwrap();
+            let mut state = crate::draw::State::default();
+            state.set_pipeline(pso);
+            state.set_heaps(&[heap]);
+            state.set_view(true, 1, destination);
+            state.set_constants(true, 2, &[2, 0xdeadbeef], 1);
+            state.dispatch(&unused, 1, 1, 1);
+            unused.close();
+        }
+        check(&b, 0xb6, 0, 0, 0);
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(cpu.cast::<u32>().add(1), 8) },
+            &[0x11223344; 8]
+        );
+        assert_eq!(unsafe {cpu.cast::<u32>().read()},0x73737373);
+        assert_eq!(unsafe {cpu.cast::<u32>().add(9).read()},0x73737373);
+        a.lock().unwrap().fill(0xa5);
+        host.execute(&[&list]);
+        check(&a, 0xa5, offset, 32, 0x11223344);
+        let list2 = host.new_list().unwrap();
+        let mut state = crate::draw::State::default();
+        state.set_pipeline(pso);
+        state.set_heaps(&[heap]);
+        state.set_view(true, 1, destination);
+        state.set_constants(true, 2, &[33, 0x55667788], 1);
+        state.dispatch(&list2, 1, 1, 1);
+        list2.close();
+        host.execute(&[&list2]);
+        check(&b, 0xb6, offset, 512, 0x55667788);
+        check(&a, 0xa5, offset, 32, 0x11223344);
+        assert!(virtual_bytes.iter().all(|&v| v == 0xed));
+        eprintln!(
+            "offset={offset} native head/tail dword sentinels 0x73737373, old lease 32 bytes, repeated closed-list submission and same-list native read correct. New lease 512 bytes (count 33, 32 threads), all physical and guest-VA sentinels preserved."
+        );
+        drop(state);
+        drop(list2);
+        drop(list);
+        assert_eq!(slot::<Release>(replacement, 0x10)(replacement), 0);
+        assert_eq!(slot::<Release>(heap, 0x10)(heap), 0);
+        assert_eq!(slot::<Release>(pso, 0x10)(pso), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "supply the locally verified LoadTriangles container on stdin"]
+    fn actual_builder_loads_a_triangle_and_reduces_its_bounds() {
+        use std::io::Read;
+        let mut input = Vec::new();
+        std::io::stdin()
+            .take(41733)
+            .read_to_end(&mut input)
+            .unwrap();
+        assert_eq!(input.len(), 41732);
+        assert_eq!(&blake3::hash(&input).to_hex()[..16], "f6e47efa50226beb");
+        // The largest possible uniform index and the complete width of each
+        // scalar load must fit in this shader's immutable code section.
+        let container = victory_shader::Container::parse(&input).unwrap();
+        let programs = victory_shader::native_programs(
+            container.part(victory_shader::FourCC::DXIL).unwrap().data,
+        )
+        .unwrap();
+        let native = &programs[0];
+        let table_sites = |code: &[u8]| {
+            let p = victory_shader::ir::build_with(
+                code,
+                native.wave64,
+                native.vgprs,
+                native.spills_root_args(),
+            )
+            .unwrap();
+            let st = victory_shader::structure::structure(&p).unwrap();
+            let Ok(resources) =
+                victory_shader::resource::track(&p, &native.layout, native.stage, Some(&st))
+            else {
+                return Vec::new();
+            };
+            resources
+                .scalar
+                .iter()
+                .filter_map(|&((b, i), ref address)| {
+                    let pc = p.blocks[b].insts[i].machine.offset;
+                    (address.param == victory_shader::resource::CODE
+                        && matches!(pc, 0x15b0 | 0x15e0))
+                    .then_some(pc)
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(table_sites(&native.code), [0x15b0, 0x15e0]);
+        assert!(table_sites(&native.code[..0x3300]).is_empty());
+        let mut excessively_wide = native.code.clone();
+        excessively_wide[0x1570..0x1574].copy_from_slice(&0x0007_0018u32.to_le_bytes());
+        assert!(table_sites(&excessively_wide).is_empty());
+        #[repr(C)]
+        struct Description {
+            root: This,
+            code: *const u8,
+            bytes: usize,
+        }
+        let null = std::ptr::null();
+        let desc = Description {
+            root: null,
+            code: input.as_ptr(),
+            bytes: input.len(),
+        };
+        let mut pipeline = null;
+        assert_eq!(
+            crate::pipeline::create_compute(
+                null,
+                (&raw const desc).cast(),
+                &PAGEABLE_IIDS[0],
+                &mut pipeline
+            ),
+            S_OK
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let stage = loop {
+            if let Some(p) = crate::pipeline::host_pipeline(pipeline) {
+                break &p.stages[0].translated().host;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "host triangle PSO unavailable"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
+        let mut resource = null;
+        let mut desc = buffer(16384);
+        desc.flags = 4;
+        assert_eq!(
+            create_committed(
+                null,
+                &PROPERTIES,
+                0,
+                &desc,
+                0,
+                null.cast(),
+                &RESOURCE_IIDS[0],
+                &mut resource
+            ),
+            S_OK
+        );
+        let (data, bytes) = buffer_bytes(resource).unwrap();
+        let base = data as u64;
+        const HEADER: usize = 0x100;
+        const EXTENT: usize = 64;
+        const OUTPUT: usize = 0x400;
+        const VERTICES: usize = 128;
+        let alloc = |flags| {
+            let mut r = null;
+            let mut d = buffer(1024);
+            d.flags = flags;
+            assert_eq!(
+                create_committed(
+                    null,
+                    &PROPERTIES,
+                    0,
+                    &d,
+                    0,
+                    null.cast(),
+                    &RESOURCE_IIDS[0],
+                    &mut r
+                ),
+                S_OK
+            );
+            (r, buffer_bytes(r).unwrap().0)
+        };
+        let (matrix_resource, matrix_data) = alloc(0);
+        let (centers_resource, centers_data) = alloc(4);
+        let (vertex_resource, vertex_data) = alloc(0);
+        let output_centers =
+            unsafe { std::slice::from_raw_parts_mut(centers_data.cast::<u32>(), 256) };
+        output_centers.fill(0x3a45b67d);
+        let matrix_input =
+            unsafe { std::slice::from_raw_parts_mut(matrix_data.cast::<u32>(), 256) };
+        matrix_input.fill(0x12233445);
+        let vertex_input =
+            unsafe { std::slice::from_raw_parts_mut(vertex_data.cast::<u32>(), 256) };
+        vertex_input.fill(0x168fa677);
+        let rotate = std::env::var_os("VICTORY_TEST_BVH_ROTATE").is_some();
+        let triangle = [-2.0f32, 3.0, -4.0, 5.0, -7.0, 2.0, 1.0, 4.0, 8.0].map(f32::to_bits);
+        let empty = [
+            f32::MAX,
+            f32::MAX,
+            f32::MAX,
+            -f32::MAX,
+            -f32::MAX,
+            -f32::MAX,
+        ]
+        .map(f32::to_bits);
+        let before = {
+            let words =
+                unsafe { std::slice::from_raw_parts_mut(data.cast::<u32>(), bytes as usize / 4) };
+            words.fill(0);
+            if rotate {
+                words[HEADER / 4 + 15] = 1 << 24;
+            }
+            words[HEADER / 4 + 4..HEADER / 4 + 10].copy_from_slice(&empty);
+            output_centers[EXTENT / 4..EXTENT / 4 + 6].copy_from_slice(&empty);
+            vertex_input[VERTICES / 4..VERTICES / 4 + 9].copy_from_slice(&triangle);
+            matrix_input[8..20].copy_from_slice(
+                &[1.0f32, 0., 0., 10., 0., 1., 0., 20., 0., 0., 1., 30.].map(f32::to_bits),
+            );
+            words.to_vec()
+        };
+        let ptr = |offset: usize| base + offset as u64;
+        let header = ptr(HEADER);
+        let extent = centers_data as u64 + EXTENT as u64;
+        let matrix = matrix_data as u64 + 32;
+        let heap = crate::descriptor::test_view_heap(128);
+        let host = crate::host::host().unwrap();
+        let list = host.new_list().unwrap();
+        let mut state = crate::draw::State::default();
+        state.set_pipeline(pipeline);
+        state.set_heaps(&[heap]);
+        // One nonindexed primitive, float3/12-byte vertices, a 3x4 matrix, two independent extent destinations.
+        state.set_constants(
+            true,
+            8,
+            &[
+                header as u32,
+                (header >> 32) as u32,
+                matrix as u32,
+                (matrix >> 32) as u32,
+                extent as u32,
+                (extent >> 32) as u32,
+                (1 << 16) | 12,
+                0,
+                1,
+                1,
+                0,
+                0,
+                0,
+                0,
+            ],
+            0,
+        );
+        for (slot, addr) in [
+            (0, ptr(OUTPUT)),
+            (4, header),
+            (5, vertex_data as u64 + VERTICES as u64),
+            (6, vertex_data as u64 + VERTICES as u64),
+            (7, vertex_data as u64 + VERTICES as u64),
+        ] {
+            state.set_view(true, slot, addr);
+        }
+        // A read-only physical allocation cannot serve the centroid atomics.
+        state.set_constants(true, 8, &[matrix as u32, (matrix >> 32) as u32], 4);
+        state.dispatch(&list, 1, 1, 1);
+        state.set_constants(true, 8, &[extent as u32, (extent >> 32) as u32], 4);
+        eprintln!(
+            "triangle stage raw host roots {:?}, SRVs {:?}, map {}",
+            stage.root_uavs, stage.root_srvs, stage.address_map
+        );
+        state.dispatch(&list, 1, 1, 1);
+        list.close();
+        host.execute(&[&list]);
+        let words = unsafe { std::slice::from_raw_parts(data.cast::<u32>(), bytes as usize / 4) };
+        let changes = before
+            .iter()
+            .zip(words)
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(i, (_, v))| (i * 4, *v))
+            .collect::<Vec<_>>();
+        eprintln!("triangle writes {:x?}", changes);
+        let mut transformed = [8.0f32, 23., 26., 15., 13., 32., 11., 24., 38.];
+        if rotate {
+            // Code-local transform table entry 1 rotates around X by -22.5 degrees.
+            let (sin, cos) = (std::f32::consts::PI / 8.).sin_cos();
+            for xyz in transformed.chunks_exact_mut(3) {
+                let (y, z) = (xyz[1], xyz[2]);
+                xyz[1] = y * cos + z * sin;
+                xyz[2] = z * cos - y * sin;
+            }
+        }
+        let mut bounds = [0.0f32; 6];
+        let mut centers = [0.0f32; 6];
+        for axis in 0..3 {
+            let vs = [
+                transformed[axis],
+                transformed[3 + axis],
+                transformed[6 + axis],
+            ];
+            bounds[axis] = vs.into_iter().reduce(f32::min).unwrap();
+            bounds[axis + 3] = vs.into_iter().reduce(f32::max).unwrap();
+            centers[axis] = (bounds[axis] + bounds[axis + 3]) * 0.5;
+            centers[axis + 3] = centers[axis];
+        }
+        for (start, source, expected) in [
+            (HEADER / 4 + 4, words, bounds.as_slice()),
+            (EXTENT / 4, &output_centers[..], centers.as_slice()),
+            (OUTPUT / 4, words, transformed.as_slice()),
+        ] {
+            for (&word, &value) in source[start..start + expected.len()].iter().zip(expected) {
+                let got = f32::from_bits(word);
+                assert!(
+                    (got - value).abs() < 2e-5,
+                    "rotation={rotate} word {start} got {got} expected {value}"
+                );
+            }
+        }
+        assert_eq!(words[HEADER / 4 + 3], 1);
+        assert_eq!(&vertex_input[VERTICES / 4..VERTICES / 4 + 9], &triangle);
+        for (i, (a, b)) in before.iter().zip(words).enumerate() {
+            if !(HEADER / 4 + 3..HEADER / 4 + 10).contains(&i)
+                && !(OUTPUT / 4..OUTPUT / 4 + 16).contains(&i)
+            {
+                assert_eq!(a, b, "unrelated write at dword {i}");
+            }
+        }
+        assert!(
+            output_centers[..EXTENT / 4]
+                .iter()
+                .chain(&output_centers[EXTENT / 4 + 6..])
+                .all(|v| *v == 0x3a45b67d)
+        );
+        assert!(
+            matrix_input[..8]
+                .iter()
+                .chain(&matrix_input[20..])
+                .all(|v| *v == 0x12233445)
+        );
+        assert!(
+            vertex_input[..VERTICES / 4]
+                .iter()
+                .chain(&vertex_input[VERTICES / 4 + 9..])
+                .all(|v| *v == 0x168fa677)
+        );
+        drop(state);
+        drop(list);
+        for obj in [
+            heap,
+            resource,
+            matrix_resource,
+            centers_resource,
+            vertex_resource,
+            pipeline,
+        ] {
+            assert_eq!(slot::<Release>(obj, 0x10)(obj), 0);
         }
     }
 

@@ -5,7 +5,7 @@
 //! writes it (view creation and descriptor copies) and again when a draw
 //! reads it through a table and finds the slot changed.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -15,6 +15,8 @@ use crate::host::{Host, host};
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
+    #[cfg(feature="diagnostics")]
+    pub(crate) material_identity: u64,
     cpu: usize,
     step: u32,
     /// Slots mirroring the title's; `spare` more follow them, and in a
@@ -33,7 +35,74 @@ pub(crate) struct HostHeap {
     kept: Mutex<Vec<Option<ID3D12Resource>>>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    next: Arc<Mutex<(u32, Vec<bool>)>>,
+    /// View heaps: the console words of each slot's descriptor, 8 dwords
+    /// per slot, for shaders that read descriptors as numbers: the buffer,
+    /// its mapping and its host GPU address.
+    words: Option<(ID3D12Resource, usize, u64)>,
+}
+
+/// A reservation in one particular native heap. The allocation bitmap
+/// survives destruction and address reuse of the title's heap facade.
+pub(crate) struct MapSlots {
+    pub(crate) first: u32,
+    taken: Arc<Mutex<(u32, Vec<bool>)>>,
+    offsets: std::ops::Range<usize>,
+}
+
+impl Drop for MapSlots {
+    fn drop(&mut self) {
+        let mut slots = self.taken.lock().unwrap_or_else(|e| e.into_inner());
+        slots.1[self.offsets.clone()].fill(false);
+    }
+}
+
+/// A GFX10 buffer descriptor's dword 3 for raw access: X Y Z W selects, a
+/// 32-bit float format, raw out-of-range checking, resource level 1. The
+/// address and size in dwords 0 to 2 are what programs read.
+const RAW_DWORD3: u32 = 0x3101_6FAC;
+
+/// The console words of a descriptor for `view`, as far as programs read
+/// them as numbers: a buffer descriptor's address, stride and record count
+/// for buffer views, constant buffers and acceleration structures (whose
+/// descriptor is a buffer at the structure); zero otherwise.
+pub(crate) fn console_words(view: &View) -> [u32; 8] {
+    let (address, len, stride) = match view {
+        View::Constant(address, size) => (*address, u64::from(*size), 0),
+        // An acceleration structure (dimension 11) names no resource: its
+        // location is the union's first quadword.
+        View::Shader(0, Some(d)) if d[1] == 11 => (
+            u64::from(d[4]) | u64::from(d[5]) << 32,
+            u64::from(u32::MAX),
+            0,
+        ),
+        v => match buffer_range(v) {
+            Some((address, len)) => {
+                let stride = match v {
+                    View::Shader(_, Some(d)) | View::Unordered(_, _, Some(d)) => d[7],
+                    View::Placed(_, _, d) => d[7],
+                    _ => 0,
+                };
+                (address, len, stride)
+            }
+            None => return [0; 8],
+        },
+    };
+    let records = if stride > 0 {
+        len / u64::from(stride)
+    } else {
+        len
+    };
+    [
+        address as u32,
+        (address >> 32) as u32 & 0xFFFF | (stride & 0x3FFF) << 16,
+        records.min(u64::from(u32::MAX)) as u32,
+        RAW_DWORD3,
+        0,
+        0,
+        0,
+        0,
+    ]
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -79,7 +148,37 @@ const SAMPLERS: u32 = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
 const SAMPLER_DYNAMIC: u32 = 256;
 
 impl HostHeap {
+    /// Mirrors a checked, directly indexed placed texture that a concrete
+    /// shader material record names. The normal descriptor registry supplied
+    /// both its generation and view before this call.
+    #[cfg(feature="diagnostics")]
+    pub(crate) fn materialize_texture(&self,index:u32,key:u64,view:&View)->bool {
+        if self.sampler || index>=self.count {return false}
+        let mut made=self.made.lock().unwrap_or_else(|e|e.into_inner());
+        self.write_words(index,console_words(view));
+        if made[index as usize]==key && self.trace_texture(index).is_some(){return true}
+        let Some(Some(resource))=make(view,self.cpu(index)) else {return false};
+        self.keep(index,Some(resource));
+        made[index as usize]=key;
+        true
+    }
+
+    #[cfg(feature="diagnostics")]
+    pub(crate) fn has_material(&self,index:u32,key:u64)->bool {
+        self.made.lock().unwrap_or_else(|e|e.into_inner()).get(index as usize)==Some(&key)
+            && self.trace_texture(index).is_some()
+    }
+    /// COM identity of the resource actually installed in a texture view.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn trace_texture(&self, index: u32) -> Option<usize> {
+        use windows::core::Interface;
+        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+        kept.get(index as usize)?.as_ref().map(|r| r.as_raw() as usize)
+    }
+
+
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
+        count.checked_add(DYNAMIC)?;
         let host = host()?;
         let kind = if sampler {
             D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER
@@ -157,8 +256,30 @@ impl HostHeap {
         tracing::debug!(count, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
+        let words = if sampler {
+            None
+        } else {
+            let header = victory_shader::emit::address_map::WORDS_HEADER;
+            let capacity = count.checked_mul(32)?;
+            let bytes = capacity.checked_add(header)?;
+            host.shared_buffer(u64::from(bytes)).map(|(buffer, data)| {
+                crate::host::name(&buffer, || format!("descriptor words {count}+{extra}"));
+                // SAFETY: a fresh mapping of `bytes`; a live buffer.
+                unsafe {
+                    std::ptr::write_bytes(data, 0, bytes as usize);
+                    data.cast::<u32>().write(capacity);
+                    let gpu = buffer.GetGPUVirtualAddress();
+                    (buffer, data as usize, gpu)
+                }
+            })
+        };
         let h = HostHeap {
             heap,
+            #[cfg(feature="diagnostics")]
+            material_identity: {
+                static NEXT: std::sync::atomic::AtomicU64=std::sync::atomic::AtomicU64::new(1);
+                NEXT.fetch_add(1,std::sync::atomic::Ordering::Relaxed)
+            },
             cpu,
             step,
             count,
@@ -166,7 +287,8 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Arc::new(Mutex::new((0, vec![false; extra as usize]))),
+            words,
         };
         // A slot never written is undefined: shaders reading one (a slot
         // the title wrote in a way we do not know, or a table entry no
@@ -314,6 +436,16 @@ impl HostHeap {
         (self.count + self.spare).saturating_sub(u32::from(self.sampler))
     }
 
+    pub(crate) fn map_slots(&self, n: u32) -> Option<MapSlots> {
+        let first = self.dynamic(n)?;
+        let at = (first - self.count) as usize;
+        Some(MapSlots {
+            first,
+            taken: self.next.clone(),
+            offsets: at..at + n as usize,
+        })
+    }
+
     /// Gives back `n` dynamic slots from `first` (an index [`dynamic`]
     /// returned).
     ///
@@ -341,6 +473,7 @@ impl HostHeap {
             }
         }
         self.keep(index, kept.flatten());
+        self.write_words(index, console_words(view));
     }
 
     /// Makes slot `index` read nothing: a null view, or a plain sampler.
@@ -351,6 +484,58 @@ impl HostHeap {
             null_view(self.cpu(index));
         }
         self.keep(index, None);
+        self.write_words(index, [0; 8]);
+    }
+
+    /// The host GPU address of the heap's descriptor words (view heaps).
+    pub(crate) fn words(&self) -> Option<(&ID3D12Resource, u64)> {
+        self.words.as_ref().map(|w| (&w.0, w.2))
+    }
+
+    fn write_words(&self, index: u32, words: [u32; 8]) {
+        let Some((_, data, _)) = self.words else {
+            return;
+        };
+        if index >= self.count {
+            return;
+        }
+        // SAFETY: slot `index` of the mapping, 32 bytes each.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                words.as_ptr(),
+                (data as *mut u32).add(
+                    victory_shader::emit::address_map::WORDS_HEADER as usize / 4
+                        + index as usize * 8,
+                ),
+                8,
+            );
+        }
+    }
+
+    /// Makes slot `index` (a dynamic one) a raw unordered access view of
+    /// `n` dwords of `buffer` from dword `first` on, holding the buffer
+    /// while the slot does.
+    pub(crate) fn raw_uav_at(&self, index: u32, buffer: &ID3D12Resource, first: u64, n: u32) {
+        let Some(host) = host() else { return };
+        let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_UAV {
+                    FirstElement: first,
+                    NumElements: n,
+                    Flags: D3D12_BUFFER_UAV_FLAG_RAW,
+                    ..Default::default()
+                },
+            },
+        };
+        // SAFETY: a slot of our heap and a live buffer.
+        unsafe {
+            host.device
+                .CreateUnorderedAccessView(buffer, None, Some(&desc), self.cpu(index))
+        };
+        self.keep(index, Some(buffer.clone()));
+        self.write_words(index, [0; 8]);
     }
 
     /// Slot `index` now views `resource` (or nothing of the host's).
@@ -365,6 +550,7 @@ impl HostHeap {
     /// memory (the list's own, which it holds).
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         self.keep(index, None);
+        self.write_words(index, [0; 8]);
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
@@ -465,6 +651,8 @@ impl HostHeap {
             }
             return None;
         };
+        // Even buffer views made only for draws have their words now.
+        self.write_words(index, console_words(&view));
         if made[index as usize] != key {
             let later = !for_draw && view.is_buffer();
             made[index as usize] = if later { 0 } else { key };
@@ -1141,6 +1329,7 @@ fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
 
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
 /// buffers).
+
 fn null_buffer_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
@@ -1215,6 +1404,16 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn registered_slot_lease_releases_only_its_own_heap_and_range() {
+        let old = std::sync::Arc::new(std::sync::Mutex::new((0, vec![true; 3])));
+        let fresh = std::sync::Arc::new(std::sync::Mutex::new((0, vec![true; 3])));
+        let lease = super::MapSlots { first: 5, taken: old.clone(), offsets: 1..3 };
+        drop(lease);
+        assert_eq!(old.lock().unwrap().1, [true, false, false]);
+        assert_eq!(fresh.lock().unwrap().1, [true, true, true]);
+    }
+
     use super::*;
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
@@ -1508,7 +1707,7 @@ void main(uint3 id : SV_DispatchThreadID) {
         let before: Vec<u32> = (0..256).map(|i| 0x7171_0000 | i).collect();
         let mut title = before.clone();
         let start = title.as_mut_ptr() as u64;
-        crate::shadow::register(start as usize, start, 1024);
+        crate::shadow::register(start as usize, start, 1024, None, 0, crate::shadow::BufferOrigin::TitleAddress);
         let shadow = crate::shadow::find(start, 1024).unwrap();
         let structured = D3D12_BUFFER_SRV {
             NumElements: 4,

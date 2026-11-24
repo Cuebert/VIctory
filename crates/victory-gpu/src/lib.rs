@@ -15,8 +15,12 @@
 //! share, [`console`] which console model the title sees. Planned:
 //! `present` (swap chain).
 
+#[cfg(windows)]
+mod address_map;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod as_join;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
@@ -30,6 +34,8 @@ pub mod frame;
 #[cfg(windows)]
 mod host;
 #[cfg(windows)]
+mod sparse_copy;
+#[cfg(windows)]
 mod indirect;
 pub mod list;
 pub mod object;
@@ -39,6 +45,8 @@ mod primitive;
 pub mod query;
 pub mod queue;
 pub mod resource;
+#[cfg(windows)]
+mod section_reset;
 pub mod root;
 #[cfg(windows)]
 mod sampler;
@@ -55,4 +63,4 @@ mod watch;
 #[cfg(windows)]
 pub use host::on_failure;
 #[cfg(windows)]
-pub use watch::{title_memory_remapped, writing as kernel_will_write};
+pub use watch::{section_output_changed, title_memory_remapped, writing as kernel_will_write};

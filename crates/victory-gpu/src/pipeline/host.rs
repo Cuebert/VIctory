@@ -8,7 +8,9 @@
 use std::ffi::{CStr, CString};
 use std::sync::Arc;
 
-use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+use victory_shader::emit::{
+    ADDRESS_MAP_SPACE, DESCRIPTOR_WORDS_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
+};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
@@ -288,6 +290,12 @@ pub(crate) struct Stage {
     /// Root parameters of its root views: (title root parameter, ours).
     pub(crate) root_cbvs: Vec<(u8, u32)>,
     pub(crate) root_srvs: Vec<(u8, u32)>,
+    /// The root parameters of the address map and of the descriptor words,
+    /// when it reads them.
+    pub(crate) address_map: Option<u32>,
+    pub(crate) descriptor_words: Option<u32>,
+    /// Root UAVs, each a one-view table.
+    pub(crate) root_uavs: Vec<(u8, u32)>,
 }
 
 impl Stage {
@@ -303,6 +311,8 @@ pub(crate) struct HostPipeline {
     pub(crate) compute: bool,
     /// A mesh pipeline (graphics without vertex input).
     pub(crate) mesh: bool,
+    /// The host PSO completes position-only screen rectangles in a geometry stage.
+    pub(crate) screen_rectangle: bool,
     pub(crate) pso: ID3D12PipelineState,
     pub(crate) root: ID3D12RootSignature,
     /// Vertex, then pixel stage, or the compute stage.
@@ -379,6 +389,9 @@ impl HostPipeline {
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                address_map: None,
+                descriptor_words: None,
+                root_uavs: Vec::new(),
             };
             let dwords = t.user_data_dwords();
             if dwords > 0 {
@@ -448,6 +461,55 @@ impl HostPipeline {
                     });
                 }
             }
+            for (wanted, space, out) in [
+                (t.address_map, ADDRESS_MAP_SPACE, &mut stage.address_map),
+                (
+                    t.descriptor_words,
+                    DESCRIPTOR_WORDS_SPACE,
+                    &mut stage.descriptor_words,
+                ),
+            ] {
+                if wanted {
+                    *out = Some(params.len() as u32);
+                    params.push(D3D12_ROOT_PARAMETER1 {
+                        ParameterType: D3D12_ROOT_PARAMETER_TYPE_SRV,
+                        Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                            Descriptor: D3D12_ROOT_DESCRIPTOR1 {
+                                ShaderRegister: 0,
+                                RegisterSpace: space,
+                                Flags: D3D12_ROOT_DESCRIPTOR_FLAG_DATA_VOLATILE,
+                            },
+                        },
+                        ShaderVisibility: visibility,
+                    });
+                }
+            }
+            for &slot in &t.root_uavs {
+                // A one-view table, as a bounded root SRV: the view's size
+                // bounds what the shader writes, which a root descriptor
+                // leaves unbounded.
+                ranges.push(Box::new(D3D12_DESCRIPTOR_RANGE1 {
+                    RangeType: D3D12_DESCRIPTOR_RANGE_TYPE_UAV,
+                    NumDescriptors: 1,
+                    BaseShaderRegister: u32::from(slot),
+                    RegisterSpace: ROOT_CBV_SPACE,
+                    Flags: D3D12_DESCRIPTOR_RANGE_FLAG_DESCRIPTORS_VOLATILE
+                        | D3D12_DESCRIPTOR_RANGE_FLAG_DATA_VOLATILE,
+                    OffsetInDescriptorsFromTableStart: 0,
+                }));
+                let range: *const D3D12_DESCRIPTOR_RANGE1 = &**ranges.last()?;
+                stage.root_uavs.push((slot, params.len() as u32));
+                params.push(D3D12_ROOT_PARAMETER1 {
+                    ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+                    Anonymous: D3D12_ROOT_PARAMETER1_0 {
+                        DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE1 {
+                            NumDescriptorRanges: 1,
+                            pDescriptorRanges: range,
+                        },
+                    },
+                    ShaderVisibility: visibility,
+                });
+            }
             for (n, s) in t.static_samplers.iter().enumerate() {
                 samplers.push(D3D12_STATIC_SAMPLER_DESC {
                     Filter: D3D12_FILTER(s.filter as i32),
@@ -511,6 +573,7 @@ impl HostPipeline {
             return Some(HostPipeline {
                 compute: true,
                 mesh: false,
+                screen_rectangle: false,
                 pso,
                 root,
                 stages: bound,
@@ -538,12 +601,12 @@ impl HostPipeline {
             let ms = MeshStages::new(code(0));
             let made = match depth_with_bounds {
                 Some(depth) => stream_pipeline(
-                    &host.device, &root, ms, code(1), g,
+                    &host.device, &root, ms, code(1), g, g.rasterizer,
                     Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
                     &name,
                 ),
                 None => stream_pipeline(
-                    &host.device, &root, ms, code(1), g,
+                    &host.device, &root, ms, code(1), g, g.rasterizer,
                     Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
                     &name,
                 ),
@@ -557,10 +620,18 @@ impl HostPipeline {
                 }
             };
             tracing::info!(?shaders, "host mesh pipeline");
+            #[cfg(feature="diagnostics")]
+            if shaders.iter().any(|s| matches!(s.hash.as_str(),"43e24028d4a1faef" | "94d281151ca58b4f")){
+                tracing::info!(?shaders,pipeline=?pso,raster=?g.rasterizer,depth=?g.depth,depth_bounds=g.depth_bounds,
+                    dsv=g.depth_format.0,targets=?&g.targets.RTFormats[..g.targets.NumRenderTargets.min(8) as usize],
+                    sample_mask=g.sample_mask,samples=g.samples.Count,mask0=g.blend.RenderTarget[0].RenderTargetWriteMask,
+                    "native raster state of sampled mesh pipeline");
+            }
             crate::host::name(&pso, || format!("{shaders:?}"));
             return Some(HostPipeline {
                 compute: false,
                 mesh: true,
+                screen_rectangle: false,
                 pso,
                 root,
                 stages: bound,
@@ -570,14 +641,27 @@ impl HostPipeline {
             });
         }
 
+        let vs = &stages[0].0.translated()?.host.dxil;
+        let ps = stages.get(1).and_then(|s| s.0.translated()).map(|t| t.host.dxil.as_slice());
+        let rectangle = (g.topology.0 == RECTANGLES && g.inputs.is_empty()
+            && victory_shader::emit::position_only_rectangle(vs, ps))
+            .then(screen_rectangle_stage).flatten();
+        let mut raster = g.rasterizer;
+        if rectangle.is_some() {
+            raster.CullMode = D3D12_CULL_MODE_NONE;
+        }
         let desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             // SAFETY: a borrowed pointer the description never releases.
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(0),
+            GS: rectangle.map_or_else(D3D12_SHADER_BYTECODE::default, |b| D3D12_SHADER_BYTECODE {
+                pShaderBytecode: b.as_ptr().cast(),
+                BytecodeLength: b.len(),
+            }),
             PS: code(1),
             BlendState: g.blend,
             SampleMask: g.sample_mask,
-            RasterizerState: g.rasterizer,
+            RasterizerState: raster,
             DepthStencilState: g.depth,
             InputLayout: D3D12_INPUT_LAYOUT_DESC {
                 pInputElementDescs: g.inputs.as_ptr(),
@@ -596,12 +680,9 @@ impl HostPipeline {
             SampleDesc: g.samples,
             ..Default::default()
         };
-        let name = super::library::name(
-            "graphics",
-            &root_blob,
-            &[&code_bytes(&code(0)), &code_bytes(&code(1))],
-            &state,
-        );
+        let shaders_for_key = [vs.as_slice(), ps.unwrap_or_default(), rectangle.unwrap_or_default()];
+        let stage_count = if rectangle.is_some() { 3 } else { 2 };
+        let name = super::library::name("graphics", &root_blob, &shaders_for_key[..stage_count], &state);
         let made = if let Some(depth) = depth_with_bounds {
             let vertex = VertexStream {
                 vs: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS, desc.VS),
@@ -615,11 +696,15 @@ impl HostPipeline {
                     desc.PrimitiveTopologyType,
                 ),
             };
-            stream_pipeline(
-                &host.device, &root, vertex, desc.PS, g,
-                Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth),
-                &name,
-            )
+            let depth = Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, depth);
+            if rectangle.is_some() {
+                #[repr(C)]
+                struct WithGeometry(VertexStream, Sub<D3D12_SHADER_BYTECODE>);
+                let stages = WithGeometry(vertex, Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS, desc.GS));
+                stream_pipeline(&host.device, &root, stages, desc.PS, g, raster, depth, &name)
+            } else {
+                stream_pipeline(&host.device, &root, vertex, desc.PS, g, raster, depth, &name)
+            }
         } else {
             super::library::pipeline(
                 &name,
@@ -638,6 +723,19 @@ impl HostPipeline {
             }
         };
         tracing::info!(?shaders, "host pipeline");
+        #[cfg(feature = "diagnostics")]
+        if shaders.iter().any(|s| s.hash == crate::capture::light_tiles::HASH) {
+            let independent = g.blend.IndependentBlendEnable.as_bool();
+            let n = (g.targets.NumRenderTargets as usize).min(8);
+            for i in 0..n {
+                let blend = &g.blend.RenderTarget[if independent {i} else {0}];
+                tracing::info!(shader=crate::capture::light_tiles::HASH, pipeline=?pso, target=i,
+                    format=g.targets.RTFormats[i].0, independent, write_mask=blend.RenderTargetWriteMask,
+                    enabled=blend.BlendEnable.as_bool(), src=blend.SrcBlend.0, dst=blend.DestBlend.0,
+                    op=blend.BlendOp.0, logic=blend.LogicOpEnable.as_bool(), sample_mask=g.sample_mask,
+                    "native fixed-function state of covered lighting draw");
+            }
+        }
         crate::host::name(&pso, || format!("{shaders:?}"));
         tracing::debug!(
             ?shaders,
@@ -651,6 +749,7 @@ impl HostPipeline {
         Some(HostPipeline {
             compute: false,
             mesh: false,
+            screen_rectangle: rectangle.is_some(),
             pso,
             root,
             stages: bound,
@@ -659,6 +758,15 @@ impl HostPipeline {
             inputs: g.elements(),
         })
     }
+}
+
+/// The single position-only geometry stage (SM 6, as are the title's stages).
+fn screen_rectangle_stage() -> Option<&'static [u8]> {
+    static STAGE: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    STAGE.get_or_init(|| crate::indirect::dxc_compile(
+        include_str!("screen_rectangle.hlsl"), windows::core::w!("gs_6_0"),
+    ).inspect_err(|e| tracing::warn!(error = %e, "screen rectangle geometry stage unavailable")).ok())
+        .as_deref()
 }
 
 /// A stream subobject: its type, then its description, pointer-aligned.
@@ -718,6 +826,7 @@ fn mesh_pipeline(
         MeshStages::new(ms),
         ps,
         g,
+        g.rasterizer,
         Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, g.depth),
         name,
     )
@@ -731,6 +840,7 @@ fn stream_pipeline<S, D>(
     stages: S,
     ps: D3D12_SHADER_BYTECODE,
     g: &GraphicsState,
+    raster: D3D12_RASTERIZER_DESC,
     depth: Sub<D>,
     name: &str,
 ) -> windows::core::Result<ID3D12PipelineState> {
@@ -753,7 +863,7 @@ fn stream_pipeline<S, D>(
         ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
         blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
         mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
-        raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
+        raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, raster),
         depth,
         targets: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, g.targets),
         dsv: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL_FORMAT, g.depth_format),

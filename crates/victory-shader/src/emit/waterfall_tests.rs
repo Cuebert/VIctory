@@ -47,6 +47,9 @@ fn build(words: &[u32], buffers: bool) -> HostShader {
         static_samplers: Vec::new(),
         root_cbvs: lowered.root_cbvs,
         root_srvs: lowered.root_srvs,
+        root_uavs: lowered.root_uavs,
+        address_map: lowered.address_map,
+        descriptor_words: lowered.descriptor_words,
     };
     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
         v.validate(&mut shader.dxil.clone())
@@ -103,7 +106,7 @@ fn native(words: &[u32], buffers: bool) -> NativeProgram {
 /// One test at a time, as the VALU tests run (#433): with these tests on
 /// the hardware adapter and WARP from several test threads at once, the
 /// test binary now and then dies of an access violation.
-fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+pub(super) fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
     static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
     ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner())
 }

@@ -20,7 +20,8 @@
 //! `VICTORY_PSO_WAIT_MS` (`0..=5000`) overrides the per-frame budget for every
 //! frame (`0` disables synchronous waiting completely).
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -31,7 +32,7 @@ use super::host::{GraphicsState, HostPipeline};
 pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
-    queued: AtomicBool,
+    queue_state: AtomicU8,
     made: OnceLock<Option<HostPipeline>>,
     /// Per-pipeline wake pair so unrelated background compiles do not wake
     /// threads waiting on a different pipeline.
@@ -66,7 +67,7 @@ impl Pending {
         Pending {
             shaders,
             graphics,
-            queued: AtomicBool::new(false),
+            queue_state: AtomicU8::new(NEW),
             made: OnceLock::new(),
             wait_lock: Mutex::new(()),
             wait_done: Condvar::new(),
@@ -269,7 +270,7 @@ pub(crate) fn waiting() -> u64 {
 /// queues it on first use.
 pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     if p.made.get().is_none() {
-        start(p);
+        start(p, DEMANDED);
         wait(p, crate::frame::current());
     }
     let made = p.made.get()?.as_ref();
@@ -279,14 +280,29 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     made
 }
 
-/// Queues `p` for the workers, once.
-fn start(p: &Arc<Pending>) {
-    if !p.queued.swap(true, Ordering::Relaxed) {
+const NEW: u8 = 0;
+const EARLY: u8 = 1;
+const DEMANDED: u8 = 2;
+const CLAIMED: u8 = 3;
+
+/// Queues once, promoting real first use ahead of pending warmup jobs.
+fn start(p: &Arc<Pending>, priority: u8) {
+    if p.queue_state.load(Ordering::Relaxed) >= priority {
+        return;
+    }
+    let Some(pool) = workers() else {
+        if p.queue_state.swap(CLAIMED, Ordering::Relaxed) == NEW {
+            p.make();
+        }
+        return;
+    };
+    let mut jobs = pool.jobs.lock().unwrap_or_else(|e| e.into_inner());
+    if jobs.submit(p, priority) {
         PEAK.fetch_max(
             WAITING.fetch_add(1, Ordering::Relaxed) + 1,
             Ordering::Relaxed,
         );
-        queue(p.clone());
+        pool.available.notify_one();
     }
 }
 
@@ -295,7 +311,7 @@ fn start(p: &Arc<Pending>) {
 pub(crate) fn early(p: &Arc<Pending>) {
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
-        start(p);
+        start(p, EARLY);
     }
 }
 
@@ -326,16 +342,80 @@ fn wait(p: &Pending, frame: u64) {
     FRAME_BUDGET.refund(frame, reserved_us - elapsed_us);
 }
 
-/// Hands `p` to the workers (half the logical processors, 2 to 8), started
-/// on first use.
-fn queue(p: Arc<Pending>) {
-    static SENDER: OnceLock<std::sync::mpsc::Sender<Arc<Pending>>> = OnceLock::new();
-    let sender = SENDER.get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
-        let receiver = Arc::new(Mutex::new(receiver));
+// Admit one warmup after a burst if both queues remain nonempty.
+const DEMAND_BURST: usize = 16;
+
+#[derive(Default)]
+struct Jobs {
+    early: VecDeque<Arc<Pending>>,
+    demanded: VecDeque<Arc<Pending>>,
+    burst: usize,
+}
+
+impl Jobs {
+    // Called under the same lock as take. Thus a promotion either moves the
+    // original Arc or observes the worker's claim, without duplicating work.
+    fn submit(&mut self, p: &Arc<Pending>, priority: u8) -> bool {
+        let state = p.queue_state.load(Ordering::Relaxed);
+        if state >= priority {
+            return false;
+        }
+        if state == EARLY {
+            let at = self.early.iter().position(|job| Arc::ptr_eq(job, p))
+                .expect("an unclaimed warmup is in the early queue");
+            let job = self.early.remove(at).unwrap();
+            self.demanded.push_back(job);
+        } else if priority == DEMANDED {
+            self.demanded.push_back(p.clone());
+        } else {
+            self.early.push_back(p.clone());
+        }
+        p.queue_state.store(priority, Ordering::Relaxed);
+        state == NEW
+    }
+
+    fn take(&mut self) -> Option<Arc<Pending>> {
+        let job = if !self.early.is_empty()
+            && (self.demanded.is_empty() || self.burst >= DEMAND_BURST)
+        {
+            self.burst = 0;
+            self.early.pop_front()
+        } else {
+            self.burst = if self.early.is_empty() { 0 } else { self.burst + 1 };
+            self.demanded.pop_front()
+        }?;
+        job.queue_state.store(CLAIMED, Ordering::Relaxed);
+        Some(job)
+    }
+}
+
+#[derive(Default)]
+struct Pool {
+    jobs: Mutex<Jobs>,
+    available: Condvar,
+}
+
+impl Pool {
+    fn next(&self) -> Arc<Pending> {
+        let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(job) = jobs.take() {
+                return job;
+            }
+            jobs = self.available.wait(jobs).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+}
+
+/// Workers start once, on first use. If none can start, the caller builds.
+fn workers() -> Option<&'static Arc<Pool>> {
+    static POOL: OnceLock<Option<Arc<Pool>>> = OnceLock::new();
+    POOL.get_or_init(|| {
+        let pool = Arc::new(Pool::default());
+        let mut any = false;
         let workers = std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8));
         for i in 0..workers {
-            let receiver = receiver.clone();
+            let receiver = pool.clone();
             let spawned = std::thread::Builder::new()
                 .name(format!("victory-pipelines-{i}"))
                 .spawn(move || {
@@ -346,8 +426,7 @@ fn queue(p: Arc<Pending>) {
                         let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
                     }
                     loop {
-                        let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                        let Ok(p) = next else { return };
+                        let p = receiver.next();
                         p.make();
                         if WAITING.fetch_sub(1, Ordering::Relaxed) == 1 {
                             drained();
@@ -358,15 +437,12 @@ fn queue(p: Arc<Pending>) {
                 });
             if let Err(e) = spawned {
                 tracing::warn!(error = %e, "no pipeline worker");
+            } else {
+                any = true;
             }
         }
-        sender
-    });
-    if let Err(e) = sender.send(p) {
-        // No worker: made here instead.
-        e.0.make();
-        WAITING.fetch_sub(1, Ordering::Relaxed);
-    }
+        any.then_some(pool)
+    }).as_ref()
 }
 
 /// The most pipelines waiting at once since the workers last ran out.
@@ -397,12 +473,55 @@ mod tests {
     fn first_use_is_made_by_a_worker() {
         let p = Arc::new(Pending::new(Vec::new(), None));
         assert!(ready(&p).is_none());
-        assert!(p.queued.load(Ordering::Relaxed));
+        assert!(p.queue_state.load(Ordering::Relaxed) >= DEMANDED);
         let started = Instant::now();
         while p.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
             std::thread::yield_now();
         }
         assert!(matches!(p.made.get(), Some(None)));
+    }
+
+    #[test]
+    fn live_demand_promotes_once_and_warmups_keep_moving() {
+        let warm: Vec<_> = (0..1_000).map(|_| Arc::new(Pending::new(vec![], None))).collect();
+        let new_demand = Arc::new(Pending::new(vec![], None));
+        let pool = Pool::default();
+        let mut jobs = pool.jobs.lock().unwrap();
+        for p in &warm {
+            assert!(jobs.submit(p, EARLY));
+        }
+        // A worker is already busy. Demand for its pipeline cannot enqueue it again.
+        let in_flight = jobs.take().unwrap();
+        assert!(Arc::ptr_eq(&in_flight, &warm[0]));
+        assert!(!jobs.submit(&in_flight, DEMANDED));
+        drop(jobs);
+        let racers = std::sync::Barrier::new(8);
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    racers.wait();
+                    let mut jobs = pool.jobs.lock().unwrap();
+                    assert!(!jobs.submit(&warm[999], DEMANDED));
+                });
+            }
+        });
+        let mut jobs = pool.jobs.lock().unwrap();
+        assert!(jobs.submit(&new_demand, DEMANDED));
+        assert!(!jobs.submit(&new_demand, EARLY));
+        for p in &warm[600..650] {
+            assert!(!jobs.submit(p, DEMANDED));
+        }
+        assert!(Arc::ptr_eq(&jobs.take().unwrap(), &warm[999]));
+        assert!(Arc::ptr_eq(&jobs.take().unwrap(), &new_demand));
+        for p in &warm[600..600 + DEMAND_BURST - 2] {
+            assert!(Arc::ptr_eq(&jobs.take().unwrap(), p));
+        }
+        assert!(Arc::ptr_eq(&jobs.take().unwrap(), &warm[1]));
+        let mut remaining = std::collections::HashSet::new();
+        while let Some(job) = jobs.take() {
+            assert!(remaining.insert(Arc::as_ptr(&job)));
+        }
+        assert_eq!(remaining.len(), 1_001 - DEMAND_BURST - 2);
     }
 
     #[test]

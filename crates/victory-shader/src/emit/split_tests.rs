@@ -427,6 +427,27 @@ fn program_lds(body: &[u32], threads: u32) -> crate::NativeProgram {
     p
 }
 
+/// A different thread owns each halfword in the same groupshared dword.
+#[test]
+fn adjacent_halfword_stores_preserve_both_lanes() {
+    let body = [
+        0x3408_0081, // v_lshlrev_b32 v4, 1, v0
+        0x2c0c_0081, // v_lshrrev_b32 v6, 1, v0
+        0x340c_0c82, // v_lshlrev_b32 v6, 2, v6
+        0xd87c_0000,
+        0x0000_0004, // ds_write_b16 v4, v0
+        0xbf8a_0000, // s_barrier
+        0xd8d8_0000,
+        0x0200_0006, // ds_read_b32 v2, v6
+    ];
+    program_case(
+        "paired halfword stores",
+        &program_lds(&body, 64),
+        |lane| (lane & !1) | ((lane | 1) << 16),
+        true,
+    );
+}
+
 /// One console wave sharing LDS without `s_barrier`: the console runs each
 /// instruction in all 64 lanes before the next, so a lane reads what a lane
 /// of the other half wrote one instruction earlier. Lane t writes t to
@@ -651,8 +672,8 @@ fn masked_whole_wave_sum_straddles_the_halves() {
     });
 }
 
-/// A whole-wave section crosses the halves only in a group of exactly one
-/// console wave: with a partial upper half, or none, it still stops.
+/// Integer scans and partially occupied upper halves retain the original
+/// refusal; the ordered half-wave path only handles supported FP additions.
 #[test]
 fn whole_wave_sections_in_partial_groups_still_stop() {
     let nvidia = super::Target {
@@ -670,6 +691,94 @@ fn whole_wave_sections_in_partial_groups_still_stop() {
                 what: "a whole-wave section of a wave64 on a host without 64-lane waves",
             }),
             "{threads} threads"
+        );
+    }
+}
+
+/// Independent scalar execution of the fixture's 64-lane scan. Rows add
+/// their predecessor at 1, 2, 4 and 8; row totals are then paired. The
+/// inactive lanes still execute the whole-wave sequence with the identity.
+fn reference_float_scan(input: [f32; 64]) -> f32 {
+    let mut v = input;
+    for shift in [1, 2, 4, 8] {
+        let old = v;
+        for i in 0..64 {
+            if i % 16 >= shift {
+                v[i] = old[i - shift] + old[i];
+            }
+        }
+    }
+    (v[31] + v[15]) + (v[63] + v[47])
+}
+
+#[test]
+fn half_wave_rejects_explicitly_reactivated_or_unknown_upper_lanes() {
+    let native32 = super::Target {
+        lanes_min: 32,
+        lanes_max: 32,
+    };
+    let mut reopened = vec![0xBEFF_03C1]; // s_mov_b32 exec_hi, -1
+    reopened.extend(reduction_scan(3, 0x80));
+    let mut discarded = vec![
+        0xBEFD_25C1, // s_or_saveexec_b64 null, -1 (no saved mask register)
+        0xBEFF_037E, // s_mov_b32 exec_hi, exec_lo
+    ];
+    discarded.extend(reduction_scan(3, 0x80));
+    let mut unknown = vec![
+        0xBE80_25C1, // s_or_saveexec_b64 s[0:1], -1
+        0xD760_000A,
+        0x0001_7F00, // v_readlane_b32 s10, v0, 63
+        0xBEFE_0400, // s_mov_b64 exec, s[0:1]
+    ];
+    for body in [&mut reopened, &mut discarded, &mut unknown] {
+        body.push(0x7E04_020A); // v_mov_b32 v2, s10
+        assert!(matches!(
+            emit_for(&program(body, 32), native32),
+            Err(crate::ShaderError::Unsupported { .. })
+        ));
+    }
+}
+
+#[test]
+fn half_full_wave_float_scan_preserves_source_add_order() {
+    for limit in [1u32, 17, 32] {
+        // v6 holds the output lane number; v5 is the untouched-output marker.
+        let mut body = vec![
+            0x7E0C_0300, // v_mov_b32 v6, v0
+            0x7E0A_0287, // v_mov_b32 v5, 7
+            0x7E00_02F2, // v_mov_b32 v0, 1.0
+            0x7E08_02FF,
+            0x4B80_0000, // v_mov_b32 v4, 2^24
+            0x7D84_0C80, // v_cmp_eq_u32 vcc, 0, v6
+            0xD501_0000,
+            0x01AA_0900, // v_cndmask_b32 v0, v0, v4, vcc
+            0x7E08_02FF,
+            0xCB80_0000, // v_mov_b32 v4, -2^24
+            0x7D84_0C82, // v_cmp_eq_u32 vcc, 2, v6
+            0xD501_0000,
+            0x01AA_0900,         // v_cndmask_b32 v0, v0, v4, vcc
+            0x7D88_0C80 | limit, // v_cmp_gt_u32 vcc, limit, v6
+            0xBE8C_246A,         // s_and_saveexec_b64 s[12:13], vcc
+        ];
+        body.extend(reduction_scan(3, 0x80));
+        body.extend([
+            0x7E0A_020A, // v_mov_b32 v5, s10
+            0x88FE_0C7E, // s_or_b64 exec, exec, s[12:13]
+            0x7E00_0306, // v_mov_b32 v0, v6
+            0x7E04_0305, // v_mov_b32 v2, v5
+        ]);
+        let input = std::array::from_fn(|lane| match lane {
+            lane if lane >= limit as usize => 0.0,
+            0 => 16_777_216.0,
+            2 => -16_777_216.0,
+            _ => 1.0,
+        });
+        let want = reference_float_scan(input).to_bits();
+        console_flow_case(
+            &format!("32 of 64 float scan, active={limit}, result={want:08x}"),
+            &body,
+            32,
+            |t| if t < limit { want } else { 7 },
         );
     }
 }

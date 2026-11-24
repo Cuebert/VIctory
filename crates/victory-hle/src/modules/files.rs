@@ -14,6 +14,8 @@
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
+mod archive_mount;
+pub use archive_mount::initialize as attach_archive_mount;
 use std::sync::{Mutex, MutexGuard};
 
 use windows_sys::Win32::Globalization::{CP_ACP, MultiByteToWideChar};
@@ -176,7 +178,13 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
 
 /// A title's wide path: the host path when it is on a virtual drive, else
 /// the title's own pointer.
-struct Wide(*const u16, Option<Vec<u16>>);
+struct Wide(*const u16, Option<Vec<u16>>, bool);
+
+// Inspect the original spelling before long-path translation can fold "..".
+fn has_parent_component(path: &[u16]) -> bool {
+    path.split(|unit| matches!(*unit, 47 | 92 | 58))
+        .any(|part| part == [46, 46])
+}
 
 impl Wide {
     fn ptr(&self) -> *const u16 {
@@ -186,7 +194,7 @@ impl Wide {
 
 fn wide(path: *const u16) -> Wide {
     if path.is_null() {
-        return Wide(path, None);
+        return Wide(path, None, false);
     }
     // SAFETY: the title passes a NUL-terminated path.
     let path_slice = unsafe {
@@ -195,7 +203,8 @@ fn wide(path: *const u16) -> Wide {
     };
     let host = translate(path_slice);
     trace(path_slice, host.as_deref());
-    Wide(path, host)
+    let parent = host.is_some() && has_parent_component(path_slice);
+    Wide(path, host, parent)
 }
 
 /// Every title path at debug level, with the host path if rewritten.
@@ -210,6 +219,10 @@ fn trace(path: &[u16], host: Option<&[u16]>) {
 /// A narrow path (ANSI code page, as the host decodes it) on a virtual
 /// drive, as a wide host path.
 fn narrow(path: *const c_char) -> Option<Vec<u16>> {
+    narrow_details(path).map(|(path, _)| path)
+}
+
+fn narrow_details(path: *const c_char) -> Option<(Vec<u16>, bool)> {
     if path.is_null() {
         return None;
     }
@@ -233,7 +246,7 @@ fn narrow(path: *const c_char) -> Option<Vec<u16>> {
     };
     let host = translate(&wide);
     trace(&wide, host.as_deref());
-    host
+    host.map(|host| (host, has_parent_component(&wide)))
 }
 
 /// An ASCII mode string (`"rb"`, `"w, ccs=UTF-8"`) for a wide CRT call.
@@ -261,6 +274,10 @@ pub extern "system" fn CreateFileW(
     template: Handle,
 ) -> Handle {
     let p = wide(path);
+    if let Some(handle) = p.1.as_deref().and_then(|resolved|
+        archive_mount::open(resolved, access, share, disposition, flags, !p.2 && security.is_null() && template.is_null())) {
+        return handle;
+    }
     host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
         p.ptr(),
         access,
@@ -281,16 +298,21 @@ pub extern "system" fn CreateFileA(
     flags: u32,
     template: Handle,
 ) -> Handle {
-    match narrow(path) {
-        Some(p) => CreateFileW(
-            p.as_ptr(),
-            access,
-            share,
-            security,
-            disposition,
-            flags,
-            template,
-        ),
+    match narrow_details(path) {
+        Some((p, parent)) => {
+            if let Some(handle) = archive_mount::open(&p, access, share, disposition, flags, !parent && security.is_null() && template.is_null()) {
+                return handle;
+            }
+            host!("kernel32.dll", "CreateFileW": extern "system" fn(*const u16, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
+                p.as_ptr(),
+                access,
+                share,
+                security,
+                disposition,
+                flags,
+                template,
+            )
+        }
         None => {
             host!("kernel32.dll", "CreateFileA": extern "system" fn(*const c_char, u32, u32, *const c_void, u32, u32, Handle) -> Handle)(
                 path,
@@ -314,6 +336,10 @@ pub extern "system" fn CreateFile2(
     params: *const c_void,
 ) -> Handle {
     let p = wide(path);
+    if let Some(handle) = p.1.as_deref().and_then(|resolved|
+        archive_mount::open(resolved, access, share, disposition, 0, !p.2 && params.is_null())) {
+        return handle;
+    }
     host!("kernel32.dll", "CreateFile2": extern "system" fn(*const u16, u32, u32, u32, *const c_void) -> Handle)(
         p.ptr(),
         access,

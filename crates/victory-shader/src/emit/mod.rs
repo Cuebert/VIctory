@@ -81,7 +81,10 @@
 //!   the console's, without `SV_PrimitiveID` and `SV_CullPrimitive` (the
 //!   console never exports them).
 
+pub mod address_map;
 mod bitcode;
+#[cfg(test)]
+mod bvh_tests;
 mod container;
 #[cfg(all(test, windows))]
 mod diff_tests;
@@ -110,7 +113,9 @@ use crate::native::{HwStage, NativeProgram, RootType};
 use crate::{ShaderError, io, ir, resource, structure};
 
 pub use sampler::StaticSampler;
-pub use shader::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
+pub use shader::{
+    ADDRESS_MAP_SPACE, DESCRIPTOR_WORDS_SPACE, ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE,
+};
 
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
@@ -169,6 +174,20 @@ pub struct HostShader {
     /// Root SRVs (raw buffers) the shader reads: `t<index>` in
     /// [`ROOT_CBV_SPACE`].
     pub root_srvs: Vec<u8>,
+    /// The shader reads title memory at addresses it computes (pointers
+    /// it loads, a BVH it walks): the host binds the address map as a
+    /// root SRV, `t0` in [`ADDRESS_MAP_SPACE`]. See [`address_map`] for
+    /// its layout.
+    pub address_map: bool,
+    /// The shader reads descriptors as numbers (a buffer's address, say):
+    /// the host binds the console words of the view heap's descriptors, 32
+    /// bytes per slot as the console lays them out, as a root SRV, `t0` in
+    /// [`DESCRIPTOR_WORDS_SPACE`]. A slot whose words the host cannot give
+    /// reads zero.
+    pub descriptor_words: bool,
+    /// Root UAVs (raw buffers) the shader reads and writes: `u<index>` in
+    /// [`ROOT_CBV_SPACE`].
+    pub root_uavs: Vec<u8>,
 }
 
 impl HostShader {
@@ -269,7 +288,7 @@ pub fn translate_for(container: &[u8], target: Target) -> Result<HostShader, Sha
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
         })?;
-    let mut p = ir::build(&native.patched_code(), native.wave64, native.vgprs)?;
+    let mut p = ir::build_with(&native.patched_code(), native.wave64, native.vgprs, native.spills_root_args())?;
     crate::sgpr_spill::forward(&mut p);
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
@@ -476,6 +495,9 @@ fn emit_program(
         samplers: l.samplers,
         root_cbvs: l.root_cbvs,
         root_srvs: l.root_srvs,
+        address_map: l.address_map,
+        descriptor_words: l.descriptor_words,
+        root_uavs: l.root_uavs,
     })
 }
 
@@ -508,6 +530,24 @@ pub(super) fn harmonize_row_interp(elements: &mut [container::SigElement]) {
             }
         }
     }
+}
+
+/// Whether the fixed screen-rectangle geometry stage links these translated stages.
+/// The vertex stage generates positions from IDs. The pixel stage reads only
+/// position, so expanding a logical rectangle introduces no extra varyings.
+pub fn position_only_rectangle(vertex: &[u8], pixel: Option<&[u8]>) -> bool {
+    fn rows(code: &[u8], part: FourCC) -> Option<Vec<container::SigElement>> {
+        signature(Container::parse(code).ok()?.part(part)?.data).ok()
+    }
+    let outputs = rows(vertex, FourCC::OSG1);
+    let Some([p]) = outputs.as_deref() else { return false };
+    p.kind == 3 && p.comp == 9 && p.index == 0 && p.row == Some(0) && p.col == 0 && p.cols == 4
+        && rows(vertex, FourCC::ISG1).is_some_and(|s| {
+            s.iter().any(|e| e.kind == 1) && s.iter().all(|e| matches!(e.kind, 1 | 2))
+        })
+        && pixel.is_none_or(|ps| rows(ps, FourCC::ISG1).is_some_and(|s| {
+            s.iter().all(|e| e.kind == 3 && e.index == 0 && e.row == Some(0))
+        }))
 }
 
 /// The rows of an `ISG1`/`OSG1` part.
@@ -730,6 +770,9 @@ mod tests {
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            address_map: false,
+            descriptor_words: false,
+            root_uavs: Vec::new(),
         };
         let file = |var: &str, stage| {
             std::env::var(var).ok().map(|p| super::HostShader {
@@ -740,6 +783,9 @@ mod tests {
                 static_samplers: Vec::new(),
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
+                address_map: false,
+                descriptor_words: false,
+                root_uavs: Vec::new(),
             })
         };
         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);

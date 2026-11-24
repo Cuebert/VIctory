@@ -11,7 +11,7 @@
 //! sequence is matched; any step the simulation does not model leaves the
 //! values it writes unknown.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::gfx10::{Dpp, Fields, NULL, Operand};
 use crate::ir::{EXEC, Inst, Program, Reg, Value};
@@ -78,6 +78,8 @@ pub(crate) enum Sym {
     Own(Value),
     /// A uniform value from before the section.
     Uni(Value),
+    /// A value in the ordered float-add expression for a half-full wave.
+    Ordered(usize),
     /// `op` over `lanes` of `mask ? src : ident` (`op` none: one lane).
     Red {
         op: Option<Op>,
@@ -93,6 +95,7 @@ pub(crate) enum Sym {
 pub(crate) enum Shape {
     K(u32),
     Value(Value),
+    Ordered(usize),
     /// The lane's own `mask ? src : ident`.
     Masked(Value, Value, u32),
     /// `op` over every lane.
@@ -106,10 +109,185 @@ pub(crate) enum Shape {
 pub(crate) struct Section {
     pub end: usize,
     pub shapes: HashMap<Value, Shape>,
+    pub ordered: Vec<FloatExpr>,
+}
+
+/// Nodes are stored after their operands. Only nodes reachable from a live
+/// scalar result are emitted.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum FloatExpr {
+    Bits(u32),
+    Lane {
+        src: Value,
+        mask: Value,
+        inactive: u32,
+        lane: u32,
+    },
+    Add(usize, usize),
 }
 
 /// Every whole-wave section of `block`, by start index.
 pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
+    sections_inner(p, block, false)
+}
+
+/// Simulate the absent upper half for a 32-thread group. Only a pure,
+/// straight-line float addition and lane-shuffle sequence is admitted.
+pub(crate) fn half_wave_sections(p: &Program, block: usize) -> HashMap<usize, Section> {
+    sections_inner(p, block, true)
+}
+
+fn pure_float_section(insts: &[Inst]) -> bool {
+    insts.iter().all(|i| match i.name() {
+        "v_cndmask_b32" | "v_mov_b32" | "v_add_f32" | "v_permlane16_b32" | "v_permlanex16_b32"
+        | "v_readlane_b32" => {
+            let Fields::Valu(v) = &i.fields else {
+                return false;
+            };
+            let permute = matches!(i.name(), "v_permlane16_b32" | "v_permlanex16_b32");
+            v.abs == 0
+                && v.neg == 0
+                && !v.clamp
+                && v.omod == 0
+                && v.sdwa.is_none()
+                && (v.opsel == 0 || permute)
+                && (i.name() != "v_readlane_b32"
+                    || matches!(v.dst, Some(Operand::Scalar { code: 0..=105, .. })))
+        }
+        "s_mov_b32" => {
+            (i.write(Reg::S(EXEC)).is_some() || i.write(Reg::S(EXEC + 1)).is_some())
+                && constant(i).is_some()
+        }
+        _ => false,
+    })
+}
+
+/// A partial group starts with EXEC_HI zero, but a scalar instruction can
+/// reopen those lanes. Propagate only copies and masks that preserve zero.
+fn zero_mask_values(p: &Program) -> HashSet<Value> {
+    let high = Reg::S(EXEC + 1);
+    let mut zero: HashSet<_> = p
+        .inputs
+        .iter()
+        .filter(|r| r.0 == high)
+        .map(|r| r.1)
+        .collect();
+    loop {
+        let before = zero.len();
+        for block in &p.blocks {
+            for phi in &block.phis {
+                if !phi.args.is_empty() && phi.args.iter().all(|v| zero.contains(v)) {
+                    zero.insert(phi.value);
+                }
+            }
+            for i in &block.insts {
+                let Fields::Sop {
+                    dst: Some(Operand::Scalar { code: dst, .. }),
+                    src,
+                    ..
+                } = &i.fields
+                else {
+                    continue;
+                };
+                if matches!(i.name(), "s_mov_b32" | "s_mov_b64") {
+                    let Some(Operand::Scalar { code: src, .. }) = src.first() else {
+                        continue;
+                    };
+                    for n in 0..if i.name() == "s_mov_b64" { 2 } else { 1 } {
+                        if i.read(Reg::S(src + n)).is_some_and(|v| zero.contains(&v))
+                            && let Some(w) = i.write(Reg::S(dst + n))
+                        {
+                            zero.insert(w);
+                        }
+                    }
+                } else if matches!(
+                    i.name(),
+                    "s_and_saveexec_b64" | "s_or_saveexec_b64" | "s_nand_saveexec_b64"
+                ) && *dst != NULL && *dst < EXEC
+                    && i.read(high).is_some_and(|v| zero.contains(&v))
+                {
+                    if let Some(w) = i.write(Reg::S(dst + 1)) {
+                        zero.insert(w);
+                    }
+                    if i.name() == "s_and_saveexec_b64"
+                        && let Some(w) = i.write(high)
+                    {
+                        zero.insert(w);
+                    }
+                }
+            }
+        }
+        if zero.len() == before {
+            return zero;
+        }
+    }
+}
+
+/// Check the incoming upper mask and the exact restore on every new section.
+pub(crate) fn partial_sections_supported(p: &Program, threads: u32) -> bool {
+    let mut zero = None;
+    for (b, block) in p.blocks.iter().enumerate() {
+        for (start, section) in sections(p, b) {
+            if threads != 32 {
+                return false;
+            }
+            let open = &block.insts[start];
+            let body = &block.insts[start + 1..section.end];
+            let close = &block.insts[section.end];
+            let zero = zero.get_or_insert_with(|| zero_mask_values(p));
+            if !pure_float_section(body)
+                || close.name() != "s_mov_b64"
+                || !matches!(open.name(), "s_or_saveexec_b64" | "s_nand_saveexec_b64")
+                || !open
+                    .read(Reg::S(EXEC + 1))
+                    .is_some_and(|v| zero.contains(&v))
+            {
+                return false;
+            }
+            let Fields::Sop {
+                dst: Some(Operand::Scalar { code: saved, .. }),
+                ..
+            } = &open.fields
+            else {
+                return false;
+            };
+            if *saved >= EXEC {
+                return false;
+            }
+            let Some(hi) = open.write(Reg::S(saved + 1)) else {
+                return false;
+            };
+            let Fields::Sop {
+                dst: Some(Operand::Scalar { code: EXEC, .. }),
+                src,
+                ..
+            } = &close.fields
+            else {
+                return false;
+            };
+            let Some(Operand::Scalar { code: restore, .. }) = src.first() else {
+                return false;
+            };
+            if close.read(Reg::S(restore + 1)) != Some(hi)
+                || close.read(Reg::S(*restore)) != open.write(Reg::S(*saved))
+            {
+                return false;
+            }
+            for i in body.iter().filter(|i| i.name() == "v_cndmask_b32") {
+                let Fields::Valu(v) = &i.fields else {
+                    return false;
+                };
+                if !matches!(v.src.get(2), Some(Operand::Scalar {code, ..}) if i.read(Reg::S(code + 1)) == Some(hi))
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn sections_inner(p: &Program, block: usize, single_half: bool) -> HashMap<usize, Section> {
     let insts = &p.blocks[block].insts;
     let wave: u32 = if p.wave64 { 64 } else { 32 };
     let mut out = HashMap::new();
@@ -144,8 +322,21 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
         let Some(end) = end else {
             break;
         };
-        let shapes = simulate(&insts[i + 1..end], wave, saved);
-        out.insert(i, Section { end, shapes });
+        let body = &insts[i + 1..end];
+        let mut ordered = Vec::new();
+        let exact = (single_half && pure_float_section(body)).then_some(&mut ordered);
+        let mut shapes = simulate(body, wave, saved, exact);
+        if single_half {
+            shapes.retain(|_, shape| matches!(shape, Shape::Ordered(_) | Shape::K(_)));
+        }
+        out.insert(
+            i,
+            Section {
+                end,
+                shapes,
+                ordered,
+            },
+        );
         i = end + 1;
     }
     out
@@ -221,7 +412,12 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
     }
 }
 
-fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
+fn simulate(
+    insts: &[Inst],
+    wave: u32,
+    saved: Value,
+    mut exact: Option<&mut Vec<FloatExpr>>,
+) -> HashMap<Value, Shape> {
     let all = if wave == 64 {
         u64::MAX
     } else {
@@ -387,6 +583,29 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
                 (0..wave as usize)
                     .map(|l| match (a[l], b.get(l).copied(), mask) {
                         (Sym::K(ident), Some(Sym::Own(x)), Some(m)) if masked.contains(&m) => {
+                            if let Some(nodes) = exact.as_deref_mut() {
+                                // Own values elsewhere in the symbolic pass
+                                // don't carry a lane index after a shuffle.
+                                if !matches!(v.src.get(1), Some(Operand::Vector { reg, .. })
+                                    if inst.read(Reg::V(*reg)) == Some(x) && !vec.contains_key(&x))
+                                {
+                                    return Sym::Unknown;
+                                }
+                                // The saved EXEC has no upper-half invocation.
+                                // WWM still runs those lanes, with the false
+                                // operand of the console's conditional move.
+                                if l >= 32 {
+                                    return Sym::K(ident);
+                                }
+                                let n = nodes.len();
+                                nodes.push(FloatExpr::Lane {
+                                    src: x,
+                                    mask: m,
+                                    inactive: ident,
+                                    lane: l as u32,
+                                });
+                                return Sym::Ordered(n);
+                            }
                             Sym::Red {
                                 op: None,
                                 src: x,
@@ -469,7 +688,33 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> HashMap<Value, Shape> {
             }
             (n, Some(a)) => match (Op::of(n), src(1)) {
                 (Some(op), Some(b)) => (0..wave as usize)
-                    .map(|l| combine(op, a[l], b[l]))
+                    .map(|l| {
+                        if op == Op::AddF
+                            && let Some(nodes) = exact.as_deref_mut()
+                        {
+                            if a[l] == Sym::K(0) && b[l] == Sym::K(0) {
+                                return Sym::K(0);
+                            }
+                            let mut node = |sym| match sym {
+                                Sym::Ordered(index) => Some(index),
+                                Sym::K(bits) => {
+                                    let n = nodes.len();
+                                    nodes.push(FloatExpr::Bits(bits));
+                                    Some(n)
+                                }
+                                _ => None,
+                            };
+                            if let (Some(left), Some(right)) = (node(a[l]), node(b[l])) {
+                                let n = nodes.len();
+                                nodes.push(FloatExpr::Add(left, right));
+                                Sym::Ordered(n)
+                            } else {
+                                Sym::Unknown
+                            }
+                        } else {
+                            combine(op, a[l], b[l])
+                        }
+                    })
                     .collect(),
                 _ => vec![Sym::Unknown; wave as usize],
             },
@@ -520,6 +765,7 @@ fn shapes(
     };
     let mut out = HashMap::new();
     let single = |s: Sym| match s {
+        Sym::Ordered(index) => Some(Shape::Ordered(index)),
         Sym::K(k) => Some(Shape::K(k)),
         Sym::Own(x) | Sym::Uni(x) => Some(Shape::Value(x)),
         Sym::Red {
@@ -563,6 +809,7 @@ fn per_lane(lanes: &[Sym], all: u64) -> Option<Shape> {
     }
     if lanes.iter().all(|&s| s == first) {
         return match first {
+            Sym::Ordered(index) => Some(Shape::Ordered(index)),
             Sym::K(k) => Some(Shape::K(k)),
             Sym::Uni(x) | Sym::Own(x) => Some(Shape::Value(x)),
             Sym::Red {

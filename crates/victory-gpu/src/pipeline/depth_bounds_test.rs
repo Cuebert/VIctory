@@ -59,11 +59,14 @@ fn host_shader(stage: &'static str, hw_stage: victory_shader::HwStage, bytes: &[
         host: victory_shader::emit::HostShader {
             stage: hw_stage,
             dxil: bytes.to_vec(),
+            address_map: false,
+            descriptor_words: false,
             user_data: Vec::new(),
             samplers: Vec::new(),
             static_samplers: Vec::new(),
             root_cbvs: Vec::new(),
             root_srvs: Vec::new(),
+            root_uavs: Vec::new(),
         },
         used: Vec::new(),
     }));
