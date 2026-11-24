@@ -359,6 +359,54 @@ impl HostHeap {
         };
     }
 
+    /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
+    /// of `buffer` from byte `offset` (a multiple of 16): a root SRV with a
+    /// size, whose reads past it return zeros instead of reaching whatever
+    /// the host placed after the buffer.
+    pub(crate) fn raw_at(&self, index: u32, buffer: &ID3D12Resource, offset: u64, len: u64) {
+        let Some(host) = host() else { return };
+        let elements = (len / 4).clamp(1, u64::from(u32::MAX)) as u32;
+        let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_TYPELESS,
+            ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
+            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Buffer: D3D12_BUFFER_SRV {
+                    FirstElement: offset / 4,
+                    NumElements: elements,
+                    StructureByteStride: 0,
+                    Flags: D3D12_BUFFER_SRV_FLAG_RAW,
+                },
+            },
+        };
+        // SAFETY: a slot of our heap and a live buffer covering the range.
+        unsafe {
+            host.device
+                .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
+        };
+        self.keep(index, Some(buffer.clone()));
+    }
+
+    /// Makes slot `index` a raw buffer view that reads zeros.
+    pub(crate) fn null_raw_at(&self, index: u32) {
+        null_buffer_view(self.cpu(index));
+        self.keep(index, None);
+    }
+
+    /// Whether this is a sampler heap.
+    pub(crate) fn is_sampler(&self) -> bool {
+        self.sampler
+    }
+
+    /// The shader-visible handle of slot `index`.
+    pub(crate) fn gpu_handle(&self, index: u32) -> D3D12_GPU_DESCRIPTOR_HANDLE {
+        // SAFETY: a live shader-visible heap.
+        let start = unsafe { self.heap.GetGPUDescriptorHandleForHeapStart().ptr };
+        D3D12_GPU_DESCRIPTOR_HANDLE {
+            ptr: start + u64::from(index) * u64::from(self.step),
+        }
+    }
+
     fn cpu(&self, index: u32) -> D3D12_CPU_DESCRIPTOR_HANDLE {
         D3D12_CPU_DESCRIPTOR_HANDLE {
             ptr: self.cpu + index as usize * self.step as usize,
@@ -1167,6 +1215,23 @@ mod tests {
 
         heap.release(tail, DYNAMIC - 9);
         assert_eq!(heap.dynamic(DYNAMIC - 9), Some(tail));
+    }
+
+    /// A view heap the host caps (the title asks for 1,310,720 views,
+    /// NVIDIA takes 1,000,000) keeps all [`DYNAMIC`] dynamic slots: the
+    /// title's slots give way, not the tables draws need made afresh.
+    #[test]
+    fn a_capped_view_heap_keeps_its_dynamic_slots() {
+        let Some(heap) = HostHeap::new(false, 1_310_720) else {
+            return; // no host GPU
+        };
+        assert_eq!(heap.spare, DYNAMIC);
+        // Capped, unless the host takes the whole heap.
+        if heap.count() != 1_310_720 {
+            assert_eq!(heap.count(), PORTABLE_VIEWS - DYNAMIC);
+        }
+        assert_eq!(heap.dynamic(DYNAMIC), Some(heap.count()));
+        assert_eq!(heap.dynamic(1), None);
     }
 
     /// A sampler heap past the host's limit is capped, not lost, and keeps
