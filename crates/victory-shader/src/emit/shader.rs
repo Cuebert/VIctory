@@ -16,6 +16,7 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
 pub(crate) mod flags {
     pub const RAW_BUFFERS: u64 = 1 << 4;
+    pub const TILED_RESOURCES: u64 = 1 << 12;
     pub const TYPED_UAV_LOADS: u64 = 1 << 13;
     pub const WAVE_OPS: u64 = 1 << 19;
     pub const INT64: u64 = 1 << 20;
@@ -78,6 +79,9 @@ pub(crate) struct Shader {
     pub wave_size: Option<u32>,
     /// Compute shader uses SM 6.6 implicit-derivative ops (`dx.valver` 1.8).
     pub cs_derivatives: bool,
+    /// A sample takes a level clamp other than 0 (tiled resources, as
+    /// validator 1.8 counts it).
+    pub lod_clamp: bool,
     /// Thread-group shared memory, in dwords.
     pub lds_dwords: u32,
     lds: Option<V>,
@@ -133,6 +137,7 @@ impl Shader {
             threads: None,
             wave_size: None,
             cs_derivatives: false,
+            lod_clamp: false,
             lds_dwords: 0,
             lds: None,
             main,
@@ -498,6 +503,11 @@ impl Shader {
         // Entry properties: shader flags (tag 0), thread-group size (4),
         // wave size (11).
         let mut props = Vec::new();
+        // A level clamp needs tiled resources; validators before 1.8 do not
+        // count it and refuse the flag (DXC `CollectShaderFlags`).
+        if self.cs_derivatives && self.lod_clamp {
+            self.flags |= flags::TILED_RESOURCES;
+        }
         if self.flags != 0 {
             props.push(i32c(&mut self, 0));
             let i64t = self.m.int(64);
@@ -579,6 +589,9 @@ impl Shader {
         dxil.extend(&bitcode);
 
         let mut features = 0u64;
+        if self.flags & flags::TILED_RESOURCES != 0 {
+            features |= 0x100;
+        }
         if self.flags & flags::TYPED_UAV_LOADS != 0 {
             features |= 0x800;
         }

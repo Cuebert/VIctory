@@ -6231,11 +6231,15 @@ impl<'a> Lower<'a> {
                     }
                 }
             }
-            // The level clamp, after the coordinates.
-            let clamp = if f.cl {
-                float(self, coord_at(coords))?
-            } else {
+            // The level clamp, after the coordinates. One known to be 0 is
+            // the constant 0, which DXC counts as no clamp.
+            let clamp = if !f.cl {
                 fu
+            } else if known(self, coord_at(coords))? == Some(0.0) {
+                self.s.m.f32(0)
+            } else {
+                self.s.lod_clamp = true;
+                float(self, coord_at(coords))?
             };
             let mut args = vec![h, sh];
             args.extend(&cs);
