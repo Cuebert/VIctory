@@ -126,18 +126,40 @@ and the name is its author's GitHub login.
 - #223 (r4tedx): translate for the host's wave sizes
 - #233 (r4tedx), at `3098672`: wave64 compute runs in halves or in the
   console flow on hosts without 64-lane waves
+- #320 (r4tedx): lane reads and writes where lanes branch differently
+  run in the console flow, on every host
+- #439 (r4tedx), head `e49302a`: one console wave sharing LDS runs in
+  the console flow. It carries peter-bonanni's commit `9b73d66`
+  ("carry whole-wave integer scans across two 32-lane waves"):
+  whole-wave sections across the two halves
+- #180 (permadiego), head `5ff639e`: twin descriptor loads, and quad
+  gradients for compute samples
 
-The wave64 part is **#223 + #233 only**. #320 and #439, which build on
-#233, are left out. Both are drafts: a whole-title
+These come in together from the branch `integration/wave64-with-180` at
+`24b3bcc`, which merges #180 into #439's head. That commit has a single
+parent, so #180's changes are in it but its own commits are not. In
+this tree, the shader tests ran on the integration machine's RTX 5070
+and also on an AMD Radeon integrated GPU (64-lane waves).
+
+**Validation failures, fixed by #180.** A whole-title
 `translate --validate` run found #320 adds 20 compute modules that fail
-DXIL validation (the driver still creates pipelines from them).
+DXIL validation (43 with #439); the driver still creates pipelines from
+them. All are compute `image_sample` emitted as `dx.op.sample`: an
+implicit-derivative sample, which validators 1.6 and 1.7 refuse outside
+pixel shaders. `main` emits 22 such modules (#233 emits the same 22).
+#180 takes the level from each quad of the console's lanes as explicit
+gradients (`sampleGrad`), which these validators accept.
+
+**Measured in the title** by testers on an RTX 5070 Ti, with the whole
+stack (#223, #233, #320, #439, #180) on `main`: 70 of the 119 compute
+programs the driver refused now run (26 with #320 alone), and none that
+ran on `main` was lost. Image results were not checked.
 
 **Open report on #233:** on Windows 10 19044 with an RTX 3080 (driver
 32.0.15.9649) and #175, NVIDIA's shader compiler faulted on some newly
 accepted compute pipelines at world entry, one pipeline was refused with
 `E_OUTOFMEMORY`, and then the device was removed. Three other NVIDIA
-machines with newer drivers did not show it. #233 also emits 22 modules
-that fail DXIL validation, but `main` already emits all 22.
+machines with newer drivers did not show it.
 
 ### Test stability
 
@@ -170,6 +192,43 @@ is described in its merge or fix commit.
   `v_readfirstlane` comes before #233's console-flow form.
 - **Mechanical fixes for #233's new arguments** in tests: `emit/lower.rs`,
   `emit/image_tests.rs`, `emit/mod.rs`, `sgpr_spill.rs`.
+- **Merge base of the wave64 stack:** #233 is in this tree as `1eb9995`,
+  the same tree as `3098672` but another commit, so git took `e0865d2`
+  (#223) as the base of `integration/wave64-with-180`. Each file was
+  merged with `3098672` as the base instead.
+- **#98 with `9b73d66` (`v_permlane16` / `v_permlanex16` in whole-wave
+  sections):** #98 models them only with every lane active, `9b73d66`
+  also with `fi` set (an inactive lane read as it is). Both conditions
+  are kept, for both instructions.
+- **#320 with #309:** #320's test for lane reads and writes in a program
+  whose lanes branch differently counts live instructions only, as #233's
+  does: dead SGPR-spill lane instructions do not send a program to the
+  console flow. #307's waterfall arm of `v_readfirstlane` still comes
+  first; #320 adds no arm of its own.
+- **Compute samples with implicit derivatives (#180 with #306 and #160):**
+  #180 decides how compute `image_sample` and `image_sample_b` are
+  emitted, in all of #160's forms (texel offset, level clamp, cube, a16).
+  It takes the console's own quads (lanes 4k to 4k+3), whereas the host's
+  compute derivatives follow the thread layout (2x2 in 2D groups). Its
+  arm now reads the bias at #160's address (after an offset, an f16 with
+  a16) and keeps #160's level clamp; its test for which programs need
+  the console's lanes uses #160's form parser instead of two names.
+  #306's validator 1.8 declaration is kept only for what still uses the
+  host's derivatives in compute: comparison samples (SM 6.6 has no
+  comparison sample with gradients). The TiledResources fix above (a
+  level clamp under 1.8) now matters only for them. #306's test of a
+  compute `image_sample` now asserts that the module does not declare
+  1.8, and still validates it and creates the pipeline. A new twin test
+  with `image_sample_c` asserts 1.8.
+- **#309's spilled-mask test with #320:** without forwarding, the
+  per-lane form still stops with "a lane mask holding lanes elsewhere
+  read as data", but the program now runs in the console flow. The test
+  checks both, and checks that forwarded spills do not ask for the
+  console flow. It uses a test-only `emit::lower_compute`.
+- **Mechanical fixes for #320's `per_lane_only`** in two tests that build
+  `lower::Parts` by hand, in `emit/lower.rs` (#307's `lower_wave`, #226's
+  annotation test). `emit/mod.rs`: module order, with `split_tests`
+  before `threading`.
 
 ## Left out on purpose
 
@@ -214,8 +273,6 @@ is described in its merge or fix commit.
   (updated upstream since, not re-reviewed)
 - #367: closed as a duplicate of #334
 - #159 (r4tedx): needs adapting to #334's state tracker first
-- #320, #439 (r4tedx): drafts, 20 modules failing validation on the
-  title (see above)
 
 ## What this tree is NOT expected to fix
 
