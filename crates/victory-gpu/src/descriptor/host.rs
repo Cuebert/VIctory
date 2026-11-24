@@ -1415,6 +1415,11 @@ impl HostHeap {
         Some(view)
     }
 
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn retained_native_slot(&self, index: u32) -> Option<ID3D12Resource> {
+        self.kept.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize)?.clone()
+    }
+
     /// Whether host slot `index` shows `buffer`; `None` if it shows no
     /// resource (diagnostics: a buffer view's slot must show the host copy
     /// that is brought up to date for it).

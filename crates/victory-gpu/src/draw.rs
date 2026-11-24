@@ -149,6 +149,8 @@ fn windows() -> bool {
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
+    #[cfg(feature = "diagnostics")]
+    irradiance: Vec<crate::irradiance_measure::Bound>,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -848,6 +850,8 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        #[cfg(feature = "diagnostics")]
+        self.irradiance.clear();
         let l = &list.list;
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
@@ -934,6 +938,15 @@ impl State {
                         Some(&(_, offset)) => offset,
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
+                }
+                #[cfg(feature = "diagnostics")]
+                if compute && crate::irradiance_measure::enabled()
+                    && let Some(user) = t.host.user_data.iter().find(|u| u.root == RootType::Table && u.slot == 1)
+                    && let Some(&base) = values.get(user.index as usize)
+                    && let Some(Root::Table(handle)) = self.roots_ref(true).get(1)
+                    && let Some(heap) = self.heap_of(*handle).and_then(|h| h.host())
+                {
+                    self.irradiance = crate::irradiance_measure::bound(&stage.shader.hash, base, heap, self.heaps[0]);
                 }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
@@ -1713,6 +1726,8 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        #[cfg(feature = "diagnostics")]
+        list.measure_irradiance(&self.irradiance, crate::irradiance_measure::Args::Direct([x, y, z]));
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2460,6 +2475,10 @@ impl State {
         };
         if kind == MESH {
             self.mesh_scissor(list, false);
+        }
+        #[cfg(feature = "diagnostics")]
+        if kind == DISPATCH && max == 1 && counter.is_none() {
+            list.measure_irradiance(&self.irradiance, crate::irradiance_measure::Args::Indirect(&bounded, at));
         }
         crate::indirect::done(list, &bounded);
         if kind == DISPATCH {

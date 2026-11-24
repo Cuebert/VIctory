@@ -114,9 +114,11 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
+    /// The private command's keys held now (the second is a compound
+    /// command's delayed key), and the phase a reading showing them may carry.
     #[cfg(all(windows, feature = "diagnostics"))]
-    fn live_key(&mut self) -> (Option<KeyState>, Option<std::sync::Arc<live_input::Phase>>) {
-        (None, None)
+    fn live_keys(&mut self) -> ([Option<KeyState>; 2], Option<std::sync::Arc<live_input::Phase>>) {
+        ([None; 2], None)
     }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
@@ -418,9 +420,9 @@ impl Hub {
             let sample = (pads, source.keys());
             #[cfg(all(windows, feature = "diagnostics"))]
             let sample = {
-                let (key, observed) = source.live_key();
+                let (keys, observed) = source.live_keys();
                 phase = observed;
-                live_input::merge(sample, key)
+                live_input::merge(sample, keys)
             };
             sample
         };
@@ -1244,9 +1246,10 @@ mod host {
         }
 
         #[cfg(feature = "diagnostics")]
-        fn live_key(&mut self) -> (Option<KeyState>, Option<std::sync::Arc<live_input::Phase>>) {
-            let key = self.live.held(Instant::now()).map(key_state);
-            (key, self.live.phase.clone())
+        fn live_keys(&mut self) -> ([Option<KeyState>; 2], Option<std::sync::Arc<live_input::Phase>>) {
+            let first = self.live.held(Instant::now());
+            let keys = [first, self.live.second].map(|key| key.map(key_state));
+            (keys, self.live.phase.clone())
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {

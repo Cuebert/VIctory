@@ -759,6 +759,8 @@ pub(crate) struct HostList {
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
     notes: Mutex<Vec<Note>>,
+    #[cfg(feature = "diagnostics")]
+    irradiance: Mutex<Vec<crate::irradiance_measure::Sample>>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -2942,6 +2944,8 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
+                irradiance: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
             })
         }
@@ -4125,6 +4129,12 @@ impl Host {
         };
         #[cfg(not(feature = "diagnostics"))]
         let groups = [&lists[..]];
+        #[cfg(feature = "diagnostics")]
+        if crate::irradiance_measure::enabled() {
+            for list in runs {
+                for sample in list.irradiance.lock().unwrap_or_else(|e| e.into_inner()).iter() { sample.before_submit(); }
+            }
+        }
         submitting(2, runs.len());
         for (i, group) in groups.iter().enumerate() {
             *submitted += 1;
@@ -4175,6 +4185,16 @@ impl Host {
             let _ = (i, started);
         }
         let _ = &firsts;
+        #[cfg(feature = "diagnostics")]
+        if crate::irradiance_measure::enabled() {
+            for (i,list) in runs.iter().enumerate() {
+                let samples = list.irradiance.lock().unwrap_or_else(|e| e.into_inner());
+                if !samples.is_empty() && !runs[i+1..].iter().any(|other| std::ptr::eq(*other,*list)) {
+                    let replays=runs.iter().filter(|other| std::ptr::eq(**other,*list)).count();
+                    for sample in samples.iter() { sample.report(this_submission, *submitted,replays); }
+                }
+            }
+        }
         FINISHED.store(this_submission, Ordering::Release);
         bury(this_submission);
         let gpu = prepared.elapsed();
@@ -4543,6 +4563,8 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.irradiance.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -4586,6 +4608,21 @@ impl HostList {
             std::collections::hash_map::Entry::Occupied(mut o) => {
                 let before = std::mem::replace(&mut o.get_mut().1, wanted);
                 (before != wanted).then_some((texture, before))
+            }
+        }
+    }
+
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn measure_irradiance(&self, bindings: &[crate::irradiance_measure::Bound], args: crate::irradiance_measure::Args<'_>) {
+        if bindings.is_empty() { return }
+        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
+        let mut samples = self.irradiance.lock().unwrap_or_else(|e| e.into_inner());
+        for binding in bindings {
+            let state = states.values().find(|(_, _, held)| held.texture.as_raw() == binding.resource.as_raw());
+            if let Some((_, state, _)) = state
+                && let Some(sample) = crate::irradiance_measure::record(&self.list, binding, *state, args)
+            {
+                samples.push(sample);
             }
         }
     }
@@ -6087,12 +6124,21 @@ impl Host {
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
             #[cfg(feature = "diagnostics")]
-            if frame <= 900 {
-                static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-                if *TRACE.get_or_init(|| std::env::var_os("VICTORY_PRESENT_TIMING").is_some()) {
+            {
+                static LAST_TRACED_FRAME: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                let limit = *LAST_TRACED_FRAME.get_or_init(|| match std::env::var_os("VICTORY_PRESENT_TIMING") {
+                    Some(mode) if mode == "all" => u64::MAX,
+                    Some(_) => 900,
+                    None => 0,
+                });
+                if frame > 0 && frame <= limit {
                     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
                     let time_us = START.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64;
-                    tracing::info!(frame, time_us, "intro present clock");
+                    if frame <= 900 {
+                        tracing::info!(frame, time_us, "intro present clock");
+                    } else {
+                        tracing::info!(frame, time_us, "native present clock");
+                    }
                 }
             }
             p.meter.frame(p.hwnd);

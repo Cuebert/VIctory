@@ -155,6 +155,19 @@ fn mirror(handle: u64) {
     }
 }
 
+/// Checks the retained resource at a captured native slot without materializing any view.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn captured_slot_still_shows(heap: usize, native_heap: usize, slot: u32, expected: usize) -> Option<bool> {
+    use windows::core::Interface;
+    let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    let &(_, _, address) = heaps.iter().find(|&&(_, _, h)| h == heap)?;
+    // Registered heaps cannot drop while this lock is held. Do not construct a
+    // missing mirror or follow a title descriptor address.
+    let host = unsafe { &*(address as *const Heap) }.host.get()?.as_ref()?;
+    if host.heap.as_raw() as usize != native_heap {return None}
+    Some(host.retained_native_slot(slot).is_some_and(|resource|resource.as_raw() as usize == expected))
+}
+
 /// Gives back dynamic slots of the host heap behind the title heap at
 /// `heap`, if that heap still exists.
 #[cfg(windows)]
