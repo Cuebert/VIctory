@@ -356,6 +356,9 @@ fn emit_program(
     };
     let pixel = native.stage == HwStage::Ps;
     let mut inputs = sig(FourCC::ISG1)?;
+    // Lowering declares the `SV_Barycentrics` a program reads, with the mode
+    // it reads them in: a row of the console's own would be a second one.
+    inputs.retain(|e| e.kind != 28);
     let mut outputs = sig(FourCC::OSG1)?;
     // Interpolation as DXC declares it by default; pixel inputs that are
     // read get the mode their barycentrics say. Conservative depth outputs
@@ -1703,6 +1706,15 @@ mod barycentric_tests {
     /// Translates a pixel program with the input VGPRs `input_addr`
     /// enables and one float4 TEXCOORD0 attribute (attr 0, row 0).
     fn pixel(words: &[u32], input_addr: u32) -> Result<HostShader, ShaderError> {
+        pixel_with(words, input_addr, &[])
+    }
+
+    /// [`pixel`] with `more` rows in the console's input signature.
+    fn pixel_with(
+        words: &[u32],
+        input_addr: u32,
+        more: &[SigElement],
+    ) -> Result<HostShader, ShaderError> {
         let native = NativeProgram {
             stage: HwStage::Ps,
             wave64: false,
@@ -1728,7 +1740,9 @@ mod barycentric_tests {
         };
         let mut target = element("SV_Target", 16, 0);
         target.usage = 15;
-        let isg1 = container::signature(&[element("TEXCOORD", 0, 0)], true);
+        let mut rows = vec![element("TEXCOORD", 0, 0)];
+        rows.extend_from_slice(more);
+        let isg1 = container::signature(&rows, true);
         let osg1 = container::signature(&[target], false);
         let bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
         let c = Container::parse(&bytes).unwrap();
@@ -1798,6 +1812,54 @@ mod barycentric_tests {
             .collect();
         indices.sort();
         assert_eq!(indices, [0, 1], "{inputs:?}");
+        validate(&shader);
+    }
+
+    /// Centre and centroid, both perspective: DXIL takes one perspective
+    /// and one linear `SV_Barycentrics`, and the validator refuses a module
+    /// with two of one kind, so the program stops with a reason.
+    #[test]
+    fn two_sample_positions_of_one_kind_are_refused_by_name() {
+        const PERSP_CENTROID: u32 = 1 << 2;
+        // v0-v1 the centre's i, j; v2-v3 the centroid's.
+        let [e0, e1] = exp_mrt0(4);
+        let words = [v_add_f32(4, 0, 3), e0, e1, 0xBF81_0000];
+        match pixel(&words, PERSP_CENTER | PERSP_CENTROID) {
+            Err(ShaderError::Unsupported { what, .. }) => {
+                assert_eq!(what, "barycentrics of two sample positions");
+            }
+            Err(e) => panic!("{e}"),
+            Ok(_) => panic!("translated"),
+        }
+    }
+
+    /// A console signature that has an `SV_Barycentrics` row of its own,
+    /// under a program that only interpolates and one that reads i and j:
+    /// the row is not carried over (lowering declares what is read), and
+    /// both modules validate.
+    #[test]
+    fn a_console_barycentrics_row_is_not_carried_over() {
+        let mut row = element("SV_Barycentrics", 28, 1);
+        row.cols = 3;
+        let [e0, e1] = exp_mrt0(2);
+        let interpolates = [
+            0xC808_0000, // v_interp_p1_f32 v2, v0, attr0.x
+            0xC809_0001, // v_interp_p2_f32 v2, v1, attr0.x
+            e0,
+            e1,
+            0xBF81_0000,
+        ];
+        let shader = pixel_with(&interpolates, PERSP_CENTER, std::slice::from_ref(&row)).unwrap();
+        let (_, inputs) = parts(&shader);
+        assert!(inputs.iter().all(|e| e.kind != 28), "{inputs:?}");
+        validate(&shader);
+
+        let reads = [v_add_f32(2, 0, 1), e0, e1, 0xBF81_0000];
+        let shader = pixel_with(&reads, PERSP_CENTER, &[row]).unwrap();
+        let (_, inputs) = parts(&shader);
+        let bary: Vec<_> = inputs.iter().filter(|e| e.kind == 28).collect();
+        assert_eq!(bary.len(), 1, "{inputs:?}");
+        assert_eq!(bary[0].row, None, "{inputs:?}");
         validate(&shader);
     }
 

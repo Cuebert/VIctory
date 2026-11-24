@@ -1652,8 +1652,17 @@ impl<'a> Lower<'a> {
             Some(id) => id,
             None => {
                 let index = self.s.inputs.iter().filter(|e| bary(e)).count() as u32;
-                if index >= 2 {
-                    return Val::Missing("barycentrics of a third interpolation mode");
+                // DXIL allows two, one perspective and one linear: a second
+                // sample position of either (centre and centroid, say) is
+                // a module the validator refuses.
+                let linear = |m: u8| matches!(m, 4 | 5 | 7);
+                if self
+                    .s
+                    .inputs
+                    .iter()
+                    .any(|e| bary(e) && linear(e.interp) == linear(mode))
+                {
+                    return Val::Missing("barycentrics of two sample positions");
                 }
                 // A system value the validator wants unpacked (packing
                 // location -1), like other non-packed system values.
