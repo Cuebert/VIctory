@@ -183,11 +183,16 @@ fn far_jump<'a>(
             (Encoding::Sop1, Some("s_getpc_b64")) if sdst == n => {
                 let Some(delta) = delta else { break };
                 // s_getpc_b64 yields the address of the instruction after it.
-                return usize::try_from(prev.offset as i64 + 4 + delta)
+                let target = usize::try_from(prev.offset as i64 + 4 + delta)
                     .ok()
                     .filter(|&t| t < len)
-                    .map(Some)
-                    .ok_or(isa(setpc.offset, "far jump target outside the code"));
+                    .ok_or(isa(setpc.offset, "far jump target outside the code"))?;
+                // Instructions are dword aligned; a literal that is not a
+                // multiple of 4 would decode from the middle of a dword.
+                if !target.is_multiple_of(4) {
+                    return Err(isa(setpc.offset, "far jump target is not dword aligned"));
+                }
+                return Ok(Some(target));
             }
             _ => {}
         }
@@ -492,5 +497,95 @@ mod tests {
         );
         // s_cbranch_scc0 into the literal of the s_mov_b32 at 4.
         assert!(decode(&bytes(&[sopp(0x04, 1), 0xBE80_03FF, S_ENDPGM, S_ENDPGM])).is_err());
+    }
+
+    /// The offset and reason `decode` refuses `code` with.
+    fn refused(code: &[u32]) -> (usize, &'static str) {
+        match decode(&bytes(code)) {
+            Err(ShaderError::Isa { offset, reason }) => (offset, reason),
+            other => panic!("expected an ISA error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn each_refusal_names_its_reason_and_offset() {
+        assert_eq!(
+            decode(&[0; 6]),
+            Err(isa(6, "code size is not a multiple of 4"))
+        );
+        // s_branch +100 from the end of a one-dword program.
+        assert_eq!(
+            refused(&[sopp(0x02, 100)]),
+            (0, "branch target outside the code")
+        );
+        // s_branch -2 from offset 0: before the start of the code.
+        assert_eq!(
+            refused(&[sopp(0x02, -2), S_ENDPGM]),
+            (0, "branch target outside the code")
+        );
+        // s_call_b64 s[0:1], +100: a call follows the same range check.
+        assert_eq!(
+            refused(&[0xBB00_0064, S_ENDPGM]),
+            (0, "branch target outside the code")
+        );
+        // s_mov_b32 s0, literal with the literal missing, after a full one.
+        assert_eq!(
+            refused(&[0xBE80_03FF, 0, 0xBE80_03FF]),
+            (8, "instruction runs past the end of the code")
+        );
+        // Code that runs off the end without s_endpgm.
+        assert_eq!(
+            refused(&[0x0600_0000]),
+            (4, "instruction runs past the end of the code")
+        );
+        // A VOP3 whose second dword is missing.
+        assert_eq!(
+            refused(&[0xD54B_0000]),
+            (0, "instruction runs past the end of the code")
+        );
+        // An MTBUF reads its second dword for the opcode's high bit.
+        assert_eq!(
+            refused(&[0xE800_0000]),
+            (0, "instruction runs past the end of the code")
+        );
+        // FLAT with segment 3.
+        assert_eq!(
+            refused(&[0xDC00_C000, 0, S_ENDPGM]),
+            (0, "reserved FLAT segment")
+        );
+        assert_eq!(refused(&[0xE400_0000, 0]), (0, "unknown encoding"));
+        // s_cbranch_scc0 into the literal of the s_mov_b32 at 4.
+        assert_eq!(
+            refused(&[sopp(0x04, 1), 0xBE80_03FF, S_ENDPGM, S_ENDPGM]),
+            (8, "a branch lands inside an instruction")
+        );
+    }
+
+    #[test]
+    fn rejects_far_jumps_off_the_code_or_off_a_dword() {
+        // s_getpc_b64 s[8:9]; s_add_u32 s8, s8, lit; s_addc_u32; s_setpc_b64.
+        let jump = |literal: u32| {
+            [
+                0xBE88_1F00,
+                0x8008_FF08,
+                literal,
+                0x8209_8009,
+                0xBE80_2008,
+                S_ENDPGM,
+            ]
+        };
+        assert_eq!(summary(&jump(16)).last(), Some(&(20, 1, "s_endpgm")));
+        assert_eq!(refused(&jump(20)), (16, "far jump target outside the code"));
+        assert_eq!(
+            refused(&jump(0xFFFF_FFF0)),
+            (16, "far jump target outside the code")
+        );
+        for literal in [13, 14, 15, 17] {
+            assert_eq!(
+                refused(&jump(literal)),
+                (16, "far jump target is not dword aligned"),
+                "literal {literal}"
+            );
+        }
     }
 }
