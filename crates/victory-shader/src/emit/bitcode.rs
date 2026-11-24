@@ -96,6 +96,7 @@ pub(crate) enum Cast {
 }
 
 /// Compare predicates: floats 0-15, integers 32-41.
+#[allow(dead_code)]
 pub(crate) mod pred {
     pub const FALSE: u8 = 0;
     pub const OEQ: u8 = 1;
@@ -470,6 +471,27 @@ impl Module {
     }
     pub fn named_md(&mut self, name: &str, nodes: Vec<Md>) {
         self.named.push((name.into(), nodes));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_dx_op(&self, name: &str, opcode: i64) -> bool {
+        self.insts.iter().any(|inst| match &inst.op {
+            Op::Call(fid, args) => {
+                self.funcs[*fid as usize].name == name
+                    && matches!(
+                        args.first(),
+                        Some(V::Const(cid)) if matches!(self.consts[*cid as usize].1, Const::Int(n) if n == opcode)
+                    )
+            }
+            _ => false,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_cmp(&self, predicate: u8) -> bool {
+        self.insts
+            .iter()
+            .any(|inst| matches!(inst.op, Op::Cmp(p, _, _) if p == predicate))
     }
 
     /// The module as bitcode.

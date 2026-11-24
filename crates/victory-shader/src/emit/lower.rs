@@ -37,6 +37,10 @@ pub(crate) struct Lowered {
     pub root_srvs: Vec<u8>,
     pub user_data: Vec<UserData>,
     pub samplers: Vec<[u32; 4]>,
+    #[cfg(test)]
+    pub has_isnan_op: bool,
+    #[cfg(test)]
+    pub has_fcmp_uno: bool,
 }
 
 pub(crate) struct Parts<'a> {
@@ -101,31 +105,44 @@ fn buffer_format(format: u8) -> Option<(&'static [u32], Numeric)> {
     const NORM: &[Numeric] = &[Unorm, Snorm, Uscaled, Sscaled, Uint, Sint];
     const ALL: &[Numeric] = &[Unorm, Snorm, Uscaled, Sscaled, Uint, Sint, Float];
     const WIDE: &[Numeric] = &[Uint, Sint, Float];
-    // `None`: a family not decoded (packed floats, 10_10_10_2).
-    const FAMILIES: [(Option<&[u32]>, &[Numeric]); 14] = [
-        (Some(&[8]), NORM),
-        (Some(&[16]), ALL),
-        (Some(&[8, 8]), NORM),
-        (Some(&[32]), WIDE),
-        (Some(&[16, 16]), ALL),
-        (None, ALL),                    // 10_11_11
-        (None, ALL),                    // 11_11_10
-        (None, NORM),                   // 10_10_10_2
-        (Some(&[10, 10, 10, 2]), NORM), // 2_10_10_10
-        (Some(&[8, 8, 8, 8]), NORM),
-        (Some(&[32, 32]), WIDE),
-        (Some(&[16, 16, 16, 16]), ALL),
-        (Some(&[32, 32, 32]), WIDE),
-        (Some(&[32, 32, 32, 32]), WIDE),
+    // Numbers and order from LLVM's `UfmtGFX10` (`SIDefines.h`); the GFX10
+    // buffer formats have no 5_9_9_9. Channel order from Mesa
+    // (`ac_formats.c`): R11G11B10_FLOAT is 10_11_11, and 10_10_10_2 has
+    // its 2-bit channel in the lowest bits.
+    const FAMILIES: [(&[u32], &[Numeric]); 14] = [
+        (&[8], NORM),
+        (&[16], ALL),
+        (&[8, 8], NORM),
+        (&[32], WIDE),
+        (&[16, 16], ALL),
+        (&[11, 11, 10], ALL),     // 10_11_11
+        (&[10, 11, 11], ALL),     // 11_11_10
+        (&[2, 10, 10, 10], NORM), // 10_10_10_2
+        (&[10, 10, 10, 2], NORM), // 2_10_10_10
+        (&[8, 8, 8, 8], NORM),
+        (&[32, 32], WIDE),
+        (&[16, 16, 16, 16], ALL),
+        (&[32, 32, 32], WIDE),
+        (&[32, 32, 32, 32], WIDE),
     ];
     let mut n = usize::from(format.checked_sub(1)?);
     for (bits, numerics) in FAMILIES {
         if n < numerics.len() {
-            return Some((bits?, numerics[n]));
+            return Some((bits, numerics[n]));
         }
         n -= numerics.len();
     }
     None
+}
+
+/// How far a float channel of `width` bits (16, or the unsigned 11- and
+/// 10-bit floats of the packed formats) shifts up to be a half:
+/// the small floats are a half's exponent (5 bits, biased 15) and the top
+/// of its mantissa, without the sign, so `legacyF16ToF32` widens them
+/// exactly, denormals, infinities and NaNs included.
+fn half_shift(width: u32) -> u32 {
+    debug_assert!(matches!(width, 10 | 11 | 16), "{width}-bit float");
+    if width == 16 { 0 } else { 15 - width }
 }
 
 struct Lower<'a> {
@@ -154,7 +171,7 @@ struct Lower<'a> {
     scalar: HashMap<Site, Address>,
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
-    handles: HashMap<(usize, Site, u8, bool, u32), V>,
+    handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
     /// Blocks splitting the edge from one IR block to another.
     edges: HashMap<(usize, usize), usize>,
     /// Per IR block: a `done` export is behind every lane entering it.
@@ -883,6 +900,10 @@ impl<'a> Lower<'a> {
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        #[cfg(test)]
+        let has_isnan_op = self.s.m.has_dx_op("dx.op.isSpecialFloat.f32", 8);
+        #[cfg(test)]
+        let has_fcmp_uno = self.s.m.has_cmp(pred::UNO);
         Ok(Lowered {
             cmp_samplers,
             root_cbvs,
@@ -890,6 +911,10 @@ impl<'a> Lower<'a> {
             dxil: self.s.finish(),
             user_data,
             samplers: self.samplers,
+            #[cfg(test)]
+            has_isnan_op,
+            #[cfg(test)]
+            has_fcmp_uno,
         })
     }
 
@@ -1406,6 +1431,11 @@ impl<'a> Lower<'a> {
     /// The median of three. With a NaN among them the hardware gives the
     /// minimum of the three instead (the host's minimum skips NaNs, so that
     /// is the smallest number among them).
+    ///
+    /// Uses `dx.op.isSpecialFloat.f32` (`IsNaN`) instead of `fcmp uno`: some
+    /// D3D12 drivers (observed on Intel Iris Xe) fold `fcmp uno x, x` to false
+    /// under default shader fast-math, returning the wrong operand when the
+    /// third input is NaN.
     fn med3(&mut self, a: V, b: V, third: V) -> V {
         let c = self.cur;
         let lo = self.binary(36, a, b);
@@ -1413,9 +1443,14 @@ impl<'a> Lower<'a> {
         let t = self.binary(36, hi, third);
         let median = self.binary(35, lo, t);
         let least = self.binary(36, lo, third);
-        let ab = self.s.m.cmp(c, pred::UNO, a, b);
-        let nan3 = self.s.m.cmp(c, pred::UNO, third, third);
-        let nan = self.s.m.bin(c, Bin::Or, ab, nan3);
+        let is_nan = |l: &mut Self, x: V| {
+            l.s.op(c, "isSpecialFloat.f32", Attr::ReadNone, l.s.t.i1, 8, &[x])
+        };
+        let nan_a = is_nan(self, a);
+        let nan_b = is_nan(self, b);
+        let nan_c = is_nan(self, third);
+        let ab = self.s.m.bin(c, Bin::Or, nan_a, nan_b);
+        let nan = self.s.m.bin(c, Bin::Or, ab, nan_c);
         self.s.m.select(c, nan, least, median)
     }
 
@@ -2597,12 +2632,21 @@ impl<'a> Lower<'a> {
                 (self.s.m.bin(c, op, a, b), None)
             }
             "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
+                // SCC: the sum overflows 32 bits, through bits shifted out
+                // of src0 or the add's carry.
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
-                let k = self.s.m.i32(u32::from(name.as_bytes()[6] - b'0'));
+                let n = u32::from(name.as_bytes()[6] - b'0');
+                let k = self.s.m.i32(n);
                 let t = self.s.m.bin(c, Bin::Shl, a, k);
-                (self.s.m.bin(c, Bin::Add, t, b), None)
+                let r = self.s.m.bin(c, Bin::Add, t, b);
+                let (rest, z) = (self.s.m.i32(32 - n), self.s.m.i32(0));
+                let out = self.s.m.bin(c, Bin::LShr, a, rest);
+                let shifted_out = self.s.m.cmp(c, pred::NE, out, z);
+                let carry = self.s.m.cmp(c, pred::IULT, r, t);
+                (r, Some(self.s.m.bin(c, Bin::Or, shifted_out, carry)))
             }
             "s_min_u32" | "s_max_u32" | "s_min_i32" | "s_max_i32" => {
+                // SCC: src0 is the one chosen.
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let p = match name {
                     "s_min_u32" => pred::IULT,
@@ -2611,7 +2655,7 @@ impl<'a> Lower<'a> {
                     _ => pred::SGT,
                 };
                 let t = self.s.m.cmp(c, p, a, b);
-                (self.s.m.select(c, t, a, b), None)
+                (self.s.m.select(c, t, a, b), Some(t))
             }
             "s_abs_i32" => {
                 let a = src32(self, 0)?;
@@ -3041,11 +3085,10 @@ impl<'a> Lower<'a> {
     /// typed loads do (channels past the format's read 0, 0, 0, 1).
     // shortcut: the descriptor's channel swizzle is taken as the identity
     // (it is for raw views and the descriptors code builds), elements of 4
-    // bytes or more as dword-aligned, and the packed float and 10_10_10_2
-    // layouts are refused; decode them when a program needs them. Norm
-    // formats divide, which the AMD driver does 1 ULP off the hardware's
-    // correctly rounded conversion for some values; correct it with an
-    // integer check if a title compares converted values exactly.
+    // bytes or more as dword-aligned. Norm formats divide, which the AMD
+    // driver does 1 ULP off the hardware's correctly rounded conversion for
+    // some values; correct it with an integer check if a title compares
+    // converted values exactly.
     fn format_load(&mut self, h: V, off: V, format: u8, channels: u32) -> Result<Vec<V>, Why> {
         let (bits, numeric) = buffer_format(format).ok_or("a buffer format")?;
         let c = self.cur;
@@ -3132,9 +3175,16 @@ impl<'a> Lower<'a> {
                 Numeric::Sint => signed(self),
                 Numeric::Float if w == 32 => field,
                 Numeric::Float => {
+                    let h = match half_shift(w) {
+                        0 => field,
+                        k => {
+                            let sh = self.s.m.i32(k);
+                            self.s.m.bin(c, Bin::Shl, field, sh)
+                        }
+                    };
                     let f = self
                         .s
-                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[field]);
+                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
                     float(self, f)
                 }
             };
@@ -3148,6 +3198,39 @@ impl<'a> Lower<'a> {
             out.push(self.s.m.i32(if k == 3 { one } else { 0 }));
         }
         out.truncate(channels as usize);
+        Ok(out)
+    }
+
+    /// Channels of buffer format `format`, as [`Self::format_load`] gives
+    /// them, as d16 data: 16 bits each, two per dword, low half first (an
+    /// odd last high half 0). Integer formats keep their low 16 bits; the
+    /// others become f16.
+    fn d16_channels(&mut self, format: u8, channels: Vec<V>) -> Result<Vec<V>, Why> {
+        let (_, numeric) = buffer_format(format).ok_or("a buffer format")?;
+        let c = self.cur;
+        let mut halves = Vec::new();
+        for x in channels {
+            halves.push(if matches!(numeric, Numeric::Uint | Numeric::Sint) {
+                let m = self.s.m.i32(0xFFFF);
+                self.s.m.bin(c, Bin::And, x, m)
+            } else {
+                let (f, i32t) = (self.as_float(x), self.s.t.i32);
+                self.s
+                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+            });
+        }
+        let mut out = Vec::new();
+        for pair in halves.chunks(2) {
+            out.push(match *pair {
+                [lo, hi] => {
+                    let k16 = self.s.m.i32(16);
+                    let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+                    self.s.m.bin(c, Bin::Or, lo, hi)
+                }
+                [lo] => lo,
+                _ => unreachable!("chunks of one or two"),
+            });
+        }
         Ok(out)
     }
 
@@ -3211,7 +3294,7 @@ impl<'a> Lower<'a> {
     ) -> Result<V, Why> {
         match src {
             Source::Loaded { load, first } => {
-                let key = (self.cur, *load, *first, sampler, props.0);
+                let key = (self.cur, *load, *first, sampler, props);
                 if let Some(&h) = self.handles.get(&key) {
                     return Ok(h);
                 }
@@ -4027,11 +4110,7 @@ impl<'a> Lower<'a> {
         let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<V, Why> {
             let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
             let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
-            let lo = l.s.m.cast(c, Cast::ZExt, lo, i64t);
-            let hi = l.s.m.cast(c, Cast::ZExt, hi, i64t);
-            let k32 = l.s.m.int_const(i64t, 32);
-            let hi = l.s.m.bin(c, Bin::Shl, hi, k32);
-            Ok(l.s.m.bin(c, Bin::Or, lo, hi))
+            Ok(l.join64(lo, hi))
         };
         match op {
             Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1)),
@@ -4048,6 +4127,16 @@ impl<'a> Lower<'a> {
                 Ok(self.s.m.cast(c, Cast::ZExt, x, i64t))
             }
         }
+    }
+
+    fn join64(&mut self, lo: V, hi: V) -> V {
+        let c = self.cur;
+        let ty = self.s.m.int(64);
+        let lo = self.s.m.cast(c, Cast::ZExt, lo, ty);
+        let hi = self.s.m.cast(c, Cast::ZExt, hi, ty);
+        let shift = self.s.m.int_const(ty, 32);
+        let hi = self.s.m.bin(c, Bin::Shl, hi, shift);
+        self.s.m.bin(c, Bin::Or, lo, hi)
     }
 
     /// The low and high dwords of an i64.
@@ -4989,26 +5078,72 @@ impl<'a> Lower<'a> {
                 } else {
                     (self.fsrc(inst, 0)?, self.fsrc(inst, 1)?)
                 };
-                let p = match op {
-                    "f" => pred::FALSE,
-                    "lt" => pred::OLT,
-                    "eq" => pred::OEQ,
-                    "le" => pred::OLE,
-                    "gt" => pred::OGT,
-                    "lg" => pred::ONE,
-                    "ge" => pred::OGE,
-                    "o" => pred::ORD,
-                    "u" => pred::UNO,
-                    "nge" => pred::ULT,
-                    "nlg" => pred::UEQ,
-                    "ngt" => pred::ULE,
-                    "nle" => pred::UGT,
-                    "neq" => pred::UNE,
-                    "nlt" => pred::UGE,
-                    "tru" => pred::TRUE,
-                    _ => return Err(inst.name()),
+                // `fsrc` may emit two separate bitcasts for the same register,
+                // which host CSE later merges into `fcmp ... %f, %f`.
+                let same_src = a == b
+                    || (self.src0.is_none()
+                        && matches!(
+                            &inst.fields,
+                            Fields::Valu(v)
+                                if v.src.len() >= 2
+                                    && v.src[0] == v.src[1]
+                                    && (v.abs & 1) == ((v.abs >> 1) & 1)
+                                    && (v.neg & 1) == ((v.neg >> 1) & 1)
+                                    && (v.opsel & 1) == ((v.opsel >> 1) & 1)
+                                    && v.sdwa.is_none()
+                        ));
+                // Some D3D12 drivers (observed on Intel Iris Xe) assume no NaNs
+                // for plain `fcmp`, folding `fcmp ord` to true, `fcmp uno` to
+                // false (even across distinct registers), and self-comparisons
+                // like `fcmp oeq/une x, x` to constants. Use DXIL `IsNaN`
+                // (`dx.op.isSpecialFloat.f32`, opcode 8) for ordered/unordered
+                // and same-value NaN-sensitive predicates.
+                let is_nan = |l: &mut Self, x: V| {
+                    l.s.op(c, "isSpecialFloat.f32", Attr::ReadNone, l.s.t.i1, 8, &[x])
                 };
-                self.s.m.cmp(c, p, a, b)
+                let any_nan = |l: &mut Self, x: V, y: V| {
+                    let nx = is_nan(l, x);
+                    if same_src {
+                        nx
+                    } else {
+                        let ny = is_nan(l, y);
+                        l.s.m.bin(c, Bin::Or, nx, ny)
+                    }
+                };
+                match op {
+                    "u" => any_nan(self, a, b),
+                    "o" => {
+                        let u = any_nan(self, a, b);
+                        let yes = self.s.m.bool(true);
+                        self.s.m.bin(c, Bin::Xor, u, yes)
+                    }
+                    "eq" | "le" | "ge" if same_src => {
+                        let n = is_nan(self, a);
+                        let yes = self.s.m.bool(true);
+                        self.s.m.bin(c, Bin::Xor, n, yes)
+                    }
+                    "neq" | "nge" | "nle" if same_src => is_nan(self, a),
+                    _ => {
+                        let p = match op {
+                            "f" => pred::FALSE,
+                            "lt" => pred::OLT,
+                            "eq" => pred::OEQ,
+                            "le" => pred::OLE,
+                            "gt" => pred::OGT,
+                            "lg" => pred::ONE,
+                            "ge" => pred::OGE,
+                            "nge" => pred::ULT,
+                            "nlg" => pred::UEQ,
+                            "ngt" => pred::ULE,
+                            "nle" => pred::UGT,
+                            "neq" => pred::UNE,
+                            "nlt" => pred::UGE,
+                            "tru" => pred::TRUE,
+                            _ => return Err(inst.name()),
+                        };
+                        self.s.m.cmp(c, p, a, b)
+                    }
+                }
             }
             "u64" | "i64" => {
                 let (a, b) = (self.src64(inst, 0)?, self.src64(inst, 1)?);
@@ -5297,8 +5432,8 @@ impl<'a> Lower<'a> {
                 .is_some_and(|u| u.kind == ResourceType::Uav);
         let props = (kind | if uav { 0x1000 } else { 0 }, 0x409);
         if let Some(op) = name.strip_prefix("image_atomic_") {
-            // DXIL's atomic operations on a 32-bit integer texture UAV; the
-            // old value returns with glc. Sub is the add of the negation.
+            // GLC returns the old value. DXIL implements subtraction by adding
+            // the two's complement of the operand at the same width.
             let code = match op {
                 "add" | "sub" => 0,
                 "and" => 1,
@@ -5318,12 +5453,13 @@ impl<'a> Lower<'a> {
             if *d16 || *a16 {
                 return Err("a 16-bit image atomic");
             }
-            // dmask: the data dwords (cmpswap: twice the value's).
-            // shortcut: 64-bit image atomics (two dwords, an R32G32 view)
-            // need the host's 64-bit typed atomics; they stop the program.
-            if *dmask != if code == u32::MAX { 3 } else { 1 } {
-                return Err("a 64-bit image atomic");
-            }
+            // Compare-exchange consumes a replacement followed by a comparand.
+            let compare = code == u32::MAX;
+            let wide = match (compare, *dmask) {
+                (false, 1) | (true, 3) => false,
+                (false, 3) | (true, 15) => true,
+                _ => return Err("an image atomic data mask"),
+            };
             let iu = self.s.m.undef(self.s.t.i32);
             let mut cs = vec![iu; 3];
             for (k, slot) in cs.iter_mut().enumerate().take(coords) {
@@ -5332,42 +5468,69 @@ impl<'a> Lower<'a> {
             let Operand::Vector { reg, .. } = *data else {
                 return Err("image atomic data");
             };
-            let vals = self.vgprs(inst, data, if code == u32::MAX { 2 } else { 1 })?;
-            let mut value = vals[0];
-            if op == "sub" {
-                let z = self.s.m.i32(0);
-                value = self.s.m.bin(c, Bin::Sub, z, value);
-            }
-            let old = match inst.read(Reg::V(reg)) {
-                Some(v) if cache.glc => self.i32_of(v)?,
-                _ => self.s.m.i32(0),
+            let width = if wide { 2 } else { 1 };
+            let vals = self.vgprs(inst, data, if compare { 2 * width } else { width })?;
+            let (ty, component) = if wide {
+                self.s.flags |= flags::INT64 | flags::ATOMIC_TYPED64 | flags::ATOMIC_HEAP64;
+                (self.s.m.int(64), 0x107) // one uint64_t in an R32G32_UINT view
+            } else {
+                (self.s.t.i32, 0x105)
             };
-            let h = self.handle(site, src, false, (kind | 0x1000, 0x105))?;
-            let at = self.begin_guarded(guard);
-            let i32t = self.s.t.i32;
+            let original = if wide {
+                self.join64(vals[0], vals[1])
+            } else {
+                vals[0]
+            };
+            let value = if op == "sub" {
+                let zero = self.s.m.int_const(ty, 0);
+                self.s.m.bin(c, Bin::Sub, zero, original)
+            } else {
+                original
+            };
+            let h = self.handle(site, src, false, (kind | 0x1000, component))?;
             let mut args = vec![h];
-            let r = if code == u32::MAX {
-                // cmpswap: data is (new, compare).
+            let (intrinsic, opcode) = if compare {
+                let comparand = if wide {
+                    self.join64(vals[2], vals[3])
+                } else {
+                    vals[1]
+                };
                 args.extend(cs);
-                args.extend([vals[1], vals[0]]);
-                self.s.op(
-                    self.cur,
-                    "atomicCompareExchange.i32",
-                    Attr::NoUnwind,
-                    i32t,
-                    79,
-                    &args,
-                )
+                args.extend([comparand, value]);
+                let intrinsic = if wide {
+                    "atomicCompareExchange.i64"
+                } else {
+                    "atomicCompareExchange.i32"
+                };
+                (intrinsic, 79)
             } else {
                 args.push(self.s.m.i32(code));
                 args.extend(cs);
                 args.push(value);
-                self.s
-                    .op(self.cur, "atomicBinOp.i32", Attr::NoUnwind, i32t, 78, &args)
+                (
+                    if wide {
+                        "atomicBinOp.i64"
+                    } else {
+                        "atomicBinOp.i32"
+                    },
+                    78,
+                )
             };
-            let r = self.end_guarded(at, &[(r, old)])[0];
+            let at = self.begin_guarded(guard);
+            let r = self
+                .s
+                .op(self.cur, intrinsic, Attr::NoUnwind, ty, opcode, &args);
             if cache.glc {
-                self.write(inst, Reg::V(reg), r, None);
+                let old = self.end_guarded(at, &[(r, original)])[0];
+                if wide {
+                    let (lo, hi) = self.split64(old);
+                    self.write(inst, Reg::V(reg), lo, None);
+                    self.write(inst, Reg::V(reg + 1), hi, None);
+                } else {
+                    self.write(inst, Reg::V(reg), old, None);
+                }
+            } else {
+                self.end_guarded(at, &[]);
             }
             return Ok(());
         }
@@ -5818,8 +5981,9 @@ impl<'a> Lower<'a> {
             Some("cmpswap") => Some(u32::MAX),
             Some(_) => return Err(name),
         };
-        // d16: two 16-bit channels per VGPR, low half first.
-        let d16 = name.starts_with("buffer_") && name.contains("_format_d16_");
+        // d16: two 16-bit channels per VGPR, low half first (buffer and
+        // tbuffer formats alike).
+        let d16 = name.contains("_format_d16_");
         let plain = name.replace("_format_d16_", "_format_");
         let (typed, count) = match plain
             .strip_prefix("buffer_load_")
@@ -6020,7 +6184,11 @@ impl<'a> Lower<'a> {
             let Some(Operand::Vector { reg, .. }) = *data else {
                 return Err("a buffer result");
             };
-            for (k, x) in self.format_load(h, off, f, count)?.into_iter().enumerate() {
+            let mut xs = self.format_load(h, off, f, count)?;
+            if d16 {
+                xs = self.d16_channels(f, xs)?;
+            }
+            for (k, x) in xs.into_iter().enumerate() {
                 self.write(inst, Reg::V(reg + k as u8), x, guard);
             }
             return Ok(());
@@ -6559,14 +6727,14 @@ impl<'a> Lower<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Numeric, Parts, buffer_format, lower};
+    use super::{Numeric, Parts, buffer_format, half_shift, lower};
     use crate::native::{ComputeIo, HwStage, NativeProgram, StageIo};
     use crate::{io, ir, resource, structure};
 
     const S_ENDPGM: u32 = 0xBF81_0000;
 
-    /// Lowers a compute program of constants: whether it translates.
-    fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
+    /// Lowers a compute program of constants and returns the lowered result.
+    fn lower_words(words: &[u32]) -> Result<super::Lowered, crate::ShaderError> {
         let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         let native = NativeProgram {
             stage: HwStage::Cs,
@@ -6595,7 +6763,33 @@ mod tests {
             prims: vec![],
             mesh_stride: 0,
         })
-        .map(|_| ())
+    }
+
+    /// Lowers a compute program of constants: whether it translates.
+    fn lowers(words: &[u32]) -> Result<(), crate::ShaderError> {
+        lower_words(words).map(|_| ())
+    }
+
+    #[test]
+    fn med3_f32_emits_dxil_isnan_instead_of_fcmp_uno() {
+        // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
+        let src0 = 256 + 1u32;
+        let src1 = 256 + 2u32;
+        let src2 = 256 + 3u32;
+        let words = [
+            0x35 << 26 | (0x157u32 << 16),
+            src0 | (src1 << 9) | (src2 << 18),
+            S_ENDPGM,
+        ];
+        let lowered = lower_words(&words).unwrap();
+        assert!(
+            lowered.has_isnan_op,
+            "v_med3_f32 must emit dx.op.isSpecialFloat.f32 (IsNaN)"
+        );
+        assert!(
+            !lowered.has_fcmp_uno,
+            "v_med3_f32 must not emit fcmp uno (folded away by some drivers)"
+        );
     }
 
     #[test]
@@ -6645,9 +6839,81 @@ mod tests {
             buffer_format(77),
             Some((&[32, 32, 32, 32][..], Numeric::Float))
         );
-        // Invalid, a packed float, past the table.
+        // Invalid, past the table.
         assert_eq!(buffer_format(0), None);
-        assert_eq!(buffer_format(36), None);
         assert_eq!(buffer_format(78), None);
+    }
+
+    #[test]
+    fn packed_buffer_formats_by_number() {
+        // LLVM's `UfmtGFX10`: 10_11_11 is 30-36, 11_11_10 37-43,
+        // 10_10_10_2 44-49. Channels from the lowest bits: R11G11B10_FLOAT
+        // is 10_11_11 (Mesa), 10_10_10_2 has the 2-bit channel first.
+        assert_eq!(buffer_format(30), Some((&[11, 11, 10][..], Numeric::Unorm)));
+        assert_eq!(buffer_format(36), Some((&[11, 11, 10][..], Numeric::Float)));
+        assert_eq!(buffer_format(37), Some((&[10, 11, 11][..], Numeric::Unorm)));
+        assert_eq!(buffer_format(43), Some((&[10, 11, 11][..], Numeric::Float)));
+        assert_eq!(
+            buffer_format(44),
+            Some((&[2, 10, 10, 10][..], Numeric::Unorm))
+        );
+        assert_eq!(
+            buffer_format(45),
+            Some((&[2, 10, 10, 10][..], Numeric::Snorm))
+        );
+        assert_eq!(
+            buffer_format(46),
+            Some((&[2, 10, 10, 10][..], Numeric::Uscaled))
+        );
+        assert_eq!(
+            buffer_format(47),
+            Some((&[2, 10, 10, 10][..], Numeric::Sscaled))
+        );
+        assert_eq!(
+            buffer_format(48),
+            Some((&[2, 10, 10, 10][..], Numeric::Uint))
+        );
+        assert_eq!(
+            buffer_format(49),
+            Some((&[2, 10, 10, 10][..], Numeric::Sint))
+        );
+    }
+
+    /// A half's value (sign, 5-bit exponent biased 15, 10-bit mantissa), as
+    /// `legacyF16ToF32` widens it.
+    fn half(h: u32) -> f32 {
+        let (s, e, m) = ((h >> 15) & 1, (h >> 10) & 31, h & 1023);
+        let v = match e {
+            0 => m as f32 * 2f32.powi(-24),
+            31 if m == 0 => f32::INFINITY,
+            31 => f32::NAN,
+            _ => (1024 + m) as f32 * 2f32.powi(e as i32 - 25),
+        };
+        if s == 1 { -v } else { v }
+    }
+
+    #[test]
+    fn small_floats_widen_as_halves() {
+        // Unsigned 11- and 10-bit floats: a 5-bit exponent biased 15 over a
+        // 6- or 5-bit mantissa, no sign; values from the D3D/GL spec.
+        let f11 = |x: u32| half(x << half_shift(11));
+        let f10 = |x: u32| half(x << half_shift(10));
+        assert_eq!(f11(0), 0.0);
+        assert_eq!(f11(0x001), 2f32.powi(-20)); // smallest denormal
+        assert_eq!(f11(0x03F), 63.0 * 2f32.powi(-20)); // largest denormal
+        assert_eq!(f11(0x040), 2f32.powi(-14)); // smallest normal
+        assert_eq!(f11(0x3C0), 1.0);
+        assert_eq!(f11(0x3E0), 1.5);
+        assert_eq!(f11(0x7BF), 65024.0); // largest
+        assert_eq!(f11(0x7C0), f32::INFINITY);
+        assert!(f11(0x7C1).is_nan());
+        assert_eq!(f10(0x001), 2f32.powi(-19));
+        assert_eq!(f10(0x020), 2f32.powi(-14));
+        assert_eq!(f10(0x1E0), 1.0);
+        assert_eq!(f10(0x3DF), 64512.0);
+        assert_eq!(f10(0x3E0), f32::INFINITY);
+        assert!(f10(0x3FF).is_nan());
+        // A 16-bit float is a half already, sign included.
+        assert_eq!(half(0xBC00 << half_shift(16)), -1.0);
     }
 }
