@@ -75,9 +75,23 @@ fn library() -> Option<&'static Mutex<Library>> {
 /// adapter or driver change, damage).
 fn open(device: &ID3D12Device1, blob: Vec<u8>) -> Option<Library> {
     let make = |bytes: &[u8]| -> windows::core::Result<ID3D12PipelineLibrary1> {
-        // SAFETY: the bytes outlive the library (kept beside it).
+        // An empty library is asked for with no blob at all. An empty slice
+        // still has an address, and vkd3d-proton refuses an address with no
+        // bytes behind it, so under Wine no library was ever kept.
+        let blob = if bytes.is_empty() { std::ptr::null() } else { bytes.as_ptr().cast() };
+        let mut library = std::ptr::null_mut();
+        // SAFETY: the bytes outlive the library (kept beside it); on success
+        // the host has written an owned ID3D12PipelineLibrary.
         unsafe {
-            device.CreatePipelineLibrary::<ID3D12PipelineLibrary>(bytes)?.cast()
+            (Interface::vtable(device).CreatePipelineLibrary)(
+                Interface::as_raw(device),
+                blob,
+                bytes.len(),
+                &ID3D12PipelineLibrary::IID,
+                &mut library,
+            )
+            .ok()?;
+            ID3D12PipelineLibrary::from_raw(library).cast()
         }
     };
     if !blob.is_empty() {
