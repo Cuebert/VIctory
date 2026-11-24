@@ -1382,6 +1382,600 @@ mod merge_tests {
     }
 }
 
+/// Whether what shaders wrote goes into title memory in runs: of a merged
+/// stretch only the chunks in which title memory changes are written, runs
+/// of them that lie apart each with a write of its own
+/// ([`merged_in_chunks`]). Enable with `VICTORY_BACK_RUNS=1` or through
+/// the diagnostic frame comparison. By default each merged stretch is written whole.
+///
+/// A merged stretch is what a submission that is waited for cuts out of a
+/// 64 KiB piece that differs ([`Shadow::copy_back`], [`Shadow::card_merge`]):
+/// from the first byte the card changed to the last. Title memory is read
+/// there and merged, and all of it went back through the kernel, also where
+/// the card had changed nothing in between: words set at both ends of a
+/// piece cost a write of all 64 KiB of it, and that write put the title's
+/// own bytes back as they were read a moment before, over whatever a thread
+/// of the title stored there since.
+///
+/// What stays as it was: the bytes merged and what they become (in title
+/// memory and in the copy), the read of the whole stretch, and the word to
+/// the guards about the whole stretch before the first write. A stretch
+/// lies in one 64 KiB page of title memory, so the write watch's journal
+/// sees the same page written whenever anything is.
+fn back_in_runs() -> bool {
+    #[cfg(feature = "diagnostics")]
+    match BACK_RUN_MODE.load(Ordering::Relaxed) {
+        1 => return false,
+        2 => return true,
+        _ => {}
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_RUNS").is_some_and(|v| v == "1"))
+}
+
+#[cfg(feature = "diagnostics")]
+static BACK_RUN_MODE: AtomicU8 = AtomicU8::new(0);
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn set_back_run_trial(enabled: bool) {
+    let mode = 1 + u8::from(enabled);
+    if BACK_RUN_MODE.swap(mode, Ordering::Relaxed) != mode {
+        tracing::info!(enabled, "changed sparse CPU copyback writes");
+    }
+}
+
+/// The bytes of a merged stretch looked at together for whether title
+/// memory changes in them ([`merged_in_chunks`]). A run begins and ends
+/// with such a chunk: at either end it holds fewer bytes than this that
+/// needed no write.
+const BACK_CHUNK: usize = 256;
+
+/// Unchanged bytes between two changed chunks of a merged stretch from
+/// which on what follows gets a write of its own; fewer go along with
+/// their neighbours. Every write is a call into the kernel, taken here to
+/// cost what copying this many bytes through it costs (an estimate, not a
+/// measurement: the timing entry in `back_tests` has a shape for it), so a
+/// stretch changed all over stays one write.
+const BACK_GAP: usize = 4096;
+
+/// The most writes a merged stretch goes into title memory with: what
+/// changes behind the last of them is written with it, gaps and all. (A
+/// stretch of a 64 KiB piece cannot hold more runs a gap apart than this.)
+const BACK_WRITES: usize = 16;
+
+/// Where a merged stretch is written into title memory: runs of it as
+/// (offset in the stretch, bytes), in order.
+struct BackRuns {
+    held: [(usize, usize); BACK_WRITES],
+    count: usize,
+}
+
+impl BackRuns {
+    fn as_slice(&self) -> &[(usize, usize)] {
+        &self.held[..self.count]
+    }
+}
+
+/// Merges a stretch of `n` bytes chunk by chunk ([`BACK_CHUNK`] bytes; the
+/// last chunk is what is left) and says where title memory is to be
+/// written. `merge` merges offsets `[from, to)` of the stretch and tells
+/// whether a byte of title memory changes there.
+///
+/// The runs hold every chunk in which one does. Of the other chunks they
+/// hold only those between two changed chunks less than [`BACK_GAP`] apart,
+/// and those in front of a changed chunk behind the last run there is room
+/// for ([`BACK_WRITES`]). Not `apart` ([`back_in_runs`] is off): the whole
+/// stretch if a byte changes anywhere in it, as before.
+fn merged_in_chunks(n: usize, apart: bool, mut merge: impl FnMut(usize, usize) -> bool) -> BackRuns {
+    let mut runs = BackRuns {
+        held: [(0, 0); BACK_WRITES],
+        count: 0,
+    };
+    let mut at = 0;
+    while at < n {
+        let end = at + BACK_CHUNK.min(n - at);
+        if merge(at, end) {
+            // Into the run before, unless a gap lies between and there is
+            // room for another run.
+            let joins = runs.count > 0 && {
+                let (from, bytes) = runs.held[runs.count - 1];
+                !apart || runs.count == BACK_WRITES || at - (from + bytes) < BACK_GAP
+            };
+            if joins {
+                let last = &mut runs.held[runs.count - 1];
+                last.1 = end - last.0;
+            } else {
+                runs.held[runs.count] = (at, end - at);
+                runs.count += 1;
+            }
+        }
+        at = end;
+    }
+    if !apart && runs.count > 0 {
+        runs.held[0] = (0, n);
+    }
+    runs
+}
+
+/// The merge of [`Shadow::card_merge`], for a stretch of a copy in the
+/// card's memory. `gpu` is what the card's side holds now, `old` the CPU's
+/// side (what the card's side held before the submission), `title` title
+/// memory as just read. The card's byte where it is not what it was before
+/// the submission, else the title's: `title` and `old` both take that.
+/// Returns where title memory is to be written ([`merged_in_chunks`]).
+fn merge_card(gpu: &[u8], old: &mut [u8], title: &mut [u8], apart: bool) -> BackRuns {
+    let n = gpu.len().min(old.len()).min(title.len());
+    merged_in_chunks(n, apart, |a, b| {
+        // Without a branch, so the loop runs many bytes at a time.
+        let mut differs = 0u8;
+        for ((t, g), o) in title[a..b].iter_mut().zip(&gpu[a..b]).zip(old[a..b].iter_mut()) {
+            let wrote = if *g != *o { 0xffu8 } else { 0 };
+            let merged = (*t & !wrote) | (*g & wrote);
+            differs |= merged ^ *t;
+            *t = merged;
+            *o = merged;
+        }
+        differs != 0
+    })
+}
+
+/// The merge of [`Shadow::copy_back`], for a stretch of a copy in the PC's
+/// memory. `host` is the copy (the card wrote it), `old` its snapshot from
+/// before the submission, `title` title memory as just read. The GPU's
+/// byte where the copy's byte is not what it was before the submission,
+/// else the title's: `title` and `host` both take that, so the copy takes
+/// the title's bytes in turn. Returns where title memory is to be written
+/// ([`merged_in_chunks`]).
+fn merge_copy(host: &mut [u8], old: &[u8], title: &mut [u8], apart: bool) -> BackRuns {
+    let n = host.len().min(old.len()).min(title.len());
+    merged_in_chunks(n, apart, |a, b| {
+        // Without a branch, so the loop runs many bytes at a time. (With
+        // the two searches for the stretch this was 44 ms a frame for 970
+        // pieces.)
+        let mut differs = 0u8;
+        for ((t, h), o) in title[a..b].iter_mut().zip(host[a..b].iter_mut()).zip(&old[a..b]) {
+            let gpu = if *h != *o { 0xffu8 } else { 0 };
+            let merged = (*t & !gpu) | (*h & gpu);
+            differs |= merged ^ *t;
+            *t = merged;
+            *h = merged;
+        }
+        differs != 0
+    })
+}
+
+/// Puts a merged stretch into title memory. `title` holds its bytes, for
+/// title address `to` on; `runs` says which of them title memory does not
+/// hold yet. The guards of the whole stretch are opened first, once, as
+/// before a write of all of it (`crate::watch::writing`); then each run is
+/// a write of its own, pages that are not mapped left alone. Returns the
+/// bytes written.
+fn write_runs(to: usize, title: &[u8], runs: &BackRuns) -> usize {
+    let runs = runs.as_slice();
+    if runs.is_empty() {
+        return 0;
+    }
+    crate::watch::writing(to, title.len());
+    let mut written = 0;
+    for &(at, n) in runs {
+        crate::host::write_mapped((to + at) as *mut u8, title[at..at + n].as_ptr(), n);
+        written += n;
+    }
+    written
+}
+
+/// `n` bytes of `title` to read title memory into, the buffer grown (by
+/// whole pieces) if it holds fewer. What it holds already is not filled
+/// again: the read writes every byte handed out, or none of them is looked
+/// at.
+fn scratch(title: &mut Vec<u8>, n: usize) -> &mut [u8] {
+    if title.len() < n {
+        title.resize(n.next_multiple_of(PIECE), 0);
+    }
+    &mut title[..n]
+}
+
+#[cfg(test)]
+mod back_tests {
+    use super::{BACK_CHUNK, BACK_GAP, BACK_WRITES, PIECE, first_difference, last_difference, merge_card, merge_copy, scratch, write_runs};
+
+    /// The merge said a byte at a time: the card's byte where it is not
+    /// what it was before the submission, else the title's.
+    fn oracle(gpu: &[u8], old: &[u8], title: &[u8]) -> Vec<u8> {
+        gpu.iter().zip(old).zip(title).map(|((&g, &o), &t)| if g != o { g } else { t }).collect()
+    }
+
+    /// `n` bytes that differ from their neighbours.
+    fn bytes(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i * 31 + i / 251 + 7) as u8).collect()
+    }
+
+    /// A stretch through both merges, against the oracle. `old` is what
+    /// the card's side held before the submission, `gpu` what it holds
+    /// after, `title` title memory as the merge reads it, `late` what
+    /// threads of the title store there after that read and before our
+    /// writes (offset, byte). Returns the runs written and title memory
+    /// afterwards.
+    fn merged(old: &[u8], gpu: &[u8], title: &[u8], late: &[(usize, u8)], apart: bool) -> (Vec<(usize, usize)>, Vec<u8>) {
+        let n = old.len();
+        let want = oracle(gpu, old, title);
+        // As `Shadow::card_merge`: the CPU's side holds the old bytes and
+        // takes the result.
+        let (mut side, mut read) = (old.to_vec(), title.to_vec());
+        let runs = merge_card(gpu, &mut side, &mut read, apart).as_slice().to_vec();
+        assert_eq!(side, want, "the CPU's side");
+        assert_eq!(read, want, "the bytes for title memory");
+        // As `Shadow::copy_back`: the copy holds the card's bytes and takes
+        // the result; the snapshot holds the old ones.
+        let (mut copy, mut read_too) = (gpu.to_vec(), title.to_vec());
+        let same = merge_copy(&mut copy, old, &mut read_too, apart).as_slice().to_vec();
+        assert_eq!(copy, want, "the copy");
+        assert_eq!(read_too, want, "the bytes for title memory, from the copy");
+        assert_eq!(same, runs, "both merges write the same runs");
+        // The runs: inside the stretch, in order, no more than the bound.
+        assert!(runs.len() <= BACK_WRITES);
+        for &(r, m) in &runs {
+            assert!(m > 0 && r + m <= n, "a run outside the stretch: {r}+{m} of {n}");
+            if apart {
+                // Whole chunks, the first and the last of them changed.
+                assert!(r % BACK_CHUNK == 0 && ((r + m) % BACK_CHUNK == 0 || r + m == n), "{r}+{m} of {n}");
+                let changes = |a: usize, b: usize| (a..b).any(|i| want[i] != title[i]);
+                assert!(changes(r, (r + BACK_CHUNK).min(r + m)), "{r}+{m} begins with a chunk that needs no write");
+                assert!(changes((r + m - 1) / BACK_CHUNK * BACK_CHUNK, r + m), "{r}+{m} ends with a chunk that needs no write");
+            }
+        }
+        if apart {
+            assert!(runs.windows(2).all(|w| w[0].0 + w[0].1 + BACK_GAP <= w[1].0), "runs less than a gap apart: {runs:?}");
+        } else {
+            let changed = want.iter().zip(title).any(|(w, t)| w != t);
+            assert_eq!(runs, if changed { vec![(0usize, n)] } else { Vec::new() });
+        }
+        // Title memory: as it was read, then the title's later bytes, then
+        // our writes.
+        let mut memory = title.to_vec();
+        for &(at, byte) in late {
+            memory[at] = byte;
+        }
+        for &(r, m) in &runs {
+            memory[r..r + m].copy_from_slice(&read[r..r + m]);
+        }
+        for at in 0..n {
+            if runs.iter().any(|&(r, m)| (r..r + m).contains(&at)) {
+                assert_eq!(memory[at], want[at], "the merged byte at {at}");
+            } else {
+                // Left alone: title memory held the merged byte already.
+                assert_eq!(want[at], title[at], "a byte that changes is not written at {at}");
+            }
+        }
+        (runs, memory)
+    }
+
+    /// Sparse: a handful of bytes far apart go back as a chunk each, not
+    /// as the 64 KiB between the first and the last of them.
+    #[test]
+    fn a_few_changed_bytes_are_written_in_runs_and_not_as_one_piece() {
+        let old = bytes(PIECE);
+        let mut gpu = old.clone();
+        for at in [0usize, 5, 20_000, PIECE - 1] {
+            gpu[at] ^= 0x5a;
+        }
+        let (runs, memory) = merged(&old, &gpu, &old, &[], true);
+        assert_eq!(runs, [(0, BACK_CHUNK), (20_000 / BACK_CHUNK * BACK_CHUNK, BACK_CHUNK), (PIECE - BACK_CHUNK, BACK_CHUNK)]);
+        assert_eq!(memory, gpu);
+        // Written whole (`VICTORY_BACK_RUNS=0`): all of it, as before.
+        let (whole, memory) = merged(&old, &gpu, &old, &[], false);
+        assert_eq!(whole, [(0, PIECE)]);
+        assert_eq!(memory, gpu);
+    }
+
+    /// Dense: bytes changed all over are one write, from the first changed
+    /// chunk to the last, however many of them the card left as they were.
+    #[test]
+    fn bytes_changed_all_over_are_written_as_one_piece() {
+        let old = bytes(PIECE);
+        // Every byte, every other one, one in 64, and one in every stretch
+        // of a gap's length (their chunks lie less than a gap apart).
+        for step in [1usize, 2, 64, BACK_GAP] {
+            let mut gpu = old.clone();
+            for at in (0..PIECE).step_by(step) {
+                gpu[at] ^= 0x81;
+            }
+            let last = (PIECE - 1) / step * step;
+            let (runs, memory) = merged(&old, &gpu, &old, &[], true);
+            assert_eq!(runs, [(0, (last / BACK_CHUNK + 1) * BACK_CHUNK)], "one byte in {step}");
+            assert_eq!(memory, gpu, "one byte in {step}");
+        }
+    }
+
+    /// The other party: bytes the title's own threads wrote while the card
+    /// ran. Beside the card's they stand, in title memory and in the copy;
+    /// where both wrote, the card's byte is the result, as before; and a
+    /// byte that title memory holds already is no reason for a write.
+    #[test]
+    fn the_titles_own_bytes_stand_beside_the_cards() {
+        let old = bytes(PIECE);
+        let (mut gpu, mut title) = (old.clone(), old.clone());
+        // The card wrote 100..108 and 30_000..30_004.
+        for at in (100..108).chain(30_000..30_004) {
+            gpu[at] ^= 0x3c;
+        }
+        // The title wrote 104..110 (over four of the card's bytes and two
+        // beside them), 9_000 (far from the card's), and at 30_001 the very
+        // byte the card wrote.
+        for at in 104..110 {
+            title[at] = !old[at];
+        }
+        title[9_000] ^= 0x11;
+        title[30_001] = gpu[30_001];
+        let (runs, memory) = merged(&old, &gpu, &title, &[], true);
+        for at in (100..108).chain(30_000..30_004) {
+            assert_eq!(memory[at], gpu[at], "the card's byte at {at}");
+        }
+        for at in [108usize, 109, 9_000] {
+            assert_eq!(memory[at], title[at], "the title's byte at {at}");
+        }
+        // The title's byte at 9_000 goes into the copy (`merged` holds the
+        // copy to the oracle) and makes no run: title memory holds it.
+        assert_eq!(runs, [(0, BACK_CHUNK), (30_000 / BACK_CHUNK * BACK_CHUNK, BACK_CHUNK)]);
+        // Everything the card wrote is in title memory already: no write,
+        // in runs or whole.
+        let mut title = old.clone();
+        for at in (100..108).chain(30_000..30_004) {
+            title[at] = gpu[at];
+        }
+        for apart in [true, false] {
+            let (runs, memory) = merged(&old, &gpu, &title, &[], apart);
+            assert!(runs.is_empty());
+            assert_eq!(memory, title);
+        }
+    }
+
+    /// The other party, later: what a thread of the title stores between
+    /// two runs after the merge read title memory stays. Written whole, it
+    /// was put back as it had been read.
+    #[test]
+    fn a_title_write_between_the_runs_after_the_read_is_not_undone() {
+        let old = bytes(PIECE);
+        let mut gpu = old.clone();
+        gpu[3] ^= 0x40;
+        gpu[PIECE - 3] ^= 0x40;
+        let at = PIECE / 2;
+        let late = [(at, !old[at])];
+        let (runs, memory) = merged(&old, &gpu, &old, &late, true);
+        assert_eq!(runs, [(0, BACK_CHUNK), (PIECE - BACK_CHUNK, BACK_CHUNK)]);
+        assert_eq!(memory[at], !old[at], "the title's later byte");
+        assert_eq!((memory[3], memory[PIECE - 3]), (gpu[3], gpu[PIECE - 3]));
+        let (_, memory) = merged(&old, &gpu, &old, &late, false);
+        assert_eq!(memory[at], old[at], "written whole, the title's later byte is undone");
+    }
+
+    /// Boundaries: two changed chunks are two writes from a gap between
+    /// them on, and one write with a chunk less between them.
+    #[test]
+    fn runs_part_where_a_gap_or_more_lies_between_changed_chunks() {
+        let far = BACK_CHUNK + BACK_GAP;
+        let old = bytes(far + 3 * BACK_CHUNK + 7);
+        // The last byte of the first chunk, and the first byte of the
+        // chunk that begins a gap behind it.
+        let mut gpu = old.clone();
+        gpu[BACK_CHUNK - 1] ^= 1;
+        gpu[far] ^= 1;
+        let (runs, _) = merged(&old, &gpu, &old, &[], true);
+        assert_eq!(runs, [(0, BACK_CHUNK), (far, BACK_CHUNK)]);
+        // One byte nearer: the chunk before.
+        let mut gpu = old.clone();
+        gpu[BACK_CHUNK - 1] ^= 1;
+        gpu[far - 1] ^= 1;
+        let (runs, _) = merged(&old, &gpu, &old, &[], true);
+        assert_eq!(runs, [(0, far)]);
+    }
+
+    /// Boundaries: stretches of every kind of length, their first and last
+    /// bytes changed. The last chunk is what is left of the stretch.
+    #[test]
+    fn stretches_of_any_length_keep_their_first_and_last_bytes() {
+        let tail = BACK_CHUNK + BACK_GAP + 1;
+        for n in [0usize, 1, 2, BACK_CHUNK - 1, BACK_CHUNK, BACK_CHUNK + 1, 3 * BACK_CHUNK + 7, tail] {
+            let old = bytes(n);
+            // Nothing changed: nothing is written, in runs or whole.
+            for apart in [true, false] {
+                assert!(merged(&old, &old, &old, &[], apart).0.is_empty(), "{n}");
+            }
+            if n == 0 {
+                continue;
+            }
+            let mut gpu = old.clone();
+            gpu[0] ^= 0x0f;
+            gpu[n - 1] ^= 0xf0;
+            let (runs, memory) = merged(&old, &gpu, &old, &[], true);
+            assert_eq!(runs.first().map(|r| r.0), Some(0), "{n}");
+            assert_eq!(runs.last().map(|r| r.0 + r.1), Some(n), "{n}");
+            assert_eq!(memory, gpu, "{n}");
+            // A last chunk of one byte, a gap behind the first chunk: a
+            // write of that byte.
+            if n == tail {
+                assert_eq!(runs, [(0, BACK_CHUNK), (n - 1, 1)]);
+            }
+            let (whole, memory) = merged(&old, &gpu, &old, &[], false);
+            assert_eq!(whole, [(0, n)], "{n}");
+            assert_eq!(memory, gpu, "{n}");
+        }
+    }
+
+    /// Bounded: more changed chunks a gap apart than a stretch has writes
+    /// for. The last write takes what is left, gaps and all, and nothing
+    /// is lost.
+    #[test]
+    fn a_stretch_is_written_in_no_more_writes_than_the_bound() {
+        let stride = BACK_CHUNK + BACK_GAP;
+        let changes = BACK_WRITES + 3;
+        let old = bytes(changes * stride);
+        let mut gpu = old.clone();
+        for i in 0..changes {
+            gpu[i * stride] ^= 0x18;
+        }
+        let (runs, memory) = merged(&old, &gpu, &old, &[], true);
+        assert_eq!(runs.len(), BACK_WRITES);
+        for (i, run) in runs.iter().enumerate().take(BACK_WRITES - 1) {
+            assert_eq!(*run, (i * stride, BACK_CHUNK));
+        }
+        let from = (BACK_WRITES - 1) * stride;
+        assert_eq!(runs[BACK_WRITES - 1], (from, (changes - 1) * stride + BACK_CHUNK - from));
+        assert_eq!(memory, gpu);
+    }
+
+    /// The scratch memory grows to what is asked and is handed out as it
+    /// is: not filled again, not made anew.
+    #[test]
+    fn scratch_memory_grows_and_is_not_filled_again() {
+        let mut title = Vec::new();
+        assert_eq!(scratch(&mut title, 10).len(), 10);
+        let held = title.len();
+        assert_eq!(held, PIECE);
+        scratch(&mut title, 10)[3] = 7;
+        assert_eq!(scratch(&mut title, 5).len(), 5);
+        assert_eq!((title[3], title.len()), (7, held));
+        assert_eq!(scratch(&mut title, PIECE).len(), PIECE);
+        assert_eq!(title.len(), held);
+        assert_eq!(scratch(&mut title, PIECE + 1).len(), PIECE + 1);
+        assert_eq!((title[3], title.len()), (7, 2 * PIECE));
+        assert!(scratch(&mut title, 0).is_empty());
+    }
+
+    /// The runs through the kernel, as the copy-back writes them: each
+    /// lands where it lies in title memory, and nothing between them is
+    /// written (a byte stored there after the read stays).
+    #[test]
+    fn runs_reach_title_memory_through_the_kernel_and_nothing_else_does() {
+        let old = bytes(PIECE);
+        let mut gpu = old.clone();
+        for at in [1usize, 20_000, PIECE - 2] {
+            gpu[at] ^= 0x5a;
+        }
+        // The CPU's side of a copy in the card's memory, and title memory.
+        let (mut side, mut memory) = (old.clone(), old.clone());
+        let to = memory.as_mut_ptr() as usize;
+        // As `Shadow::card_merge` cuts the stretch: from the first byte
+        // the card changed to the last.
+        let first = first_difference(&gpu, &side).expect("changed");
+        let last = last_difference(&gpu, &side).expect("changed");
+        assert_eq!((first, last), (1, PIECE - 2));
+        let n = last + 1 - first;
+        let mut read = Vec::new();
+        let read = scratch(&mut read, n);
+        assert!(crate::host::read_into((to + first) as *const u8, read));
+        let runs = merge_card(&gpu[first..=last], &mut side[first..=last], read, true);
+        let chunk_of = |at: usize| at / BACK_CHUNK * BACK_CHUNK;
+        let tail = chunk_of(n - 1);
+        assert_eq!(runs.as_slice().to_vec(), vec![(0, BACK_CHUNK), (chunk_of(20_000 - first), BACK_CHUNK), (tail, n - tail)]);
+        // A thread of the title stores a byte between two runs, after the
+        // read.
+        memory[10_000] = !old[10_000];
+        assert_eq!(write_runs(to + first, read, &runs), 2 * BACK_CHUNK + n - tail);
+        let mut want = gpu.clone();
+        want[10_000] = !old[10_000];
+        assert!(memory == want, "title memory");
+        assert!(side == gpu, "the CPU's side");
+    }
+
+    /// The timing entry: a frame's worth of pieces (873 of 64 KiB, the
+    /// 57.2 MB the measured frame put back) through what
+    /// `Shadow::card_merge` does with each on the processor: the two
+    /// searches for the stretch, the read of title memory through the
+    /// kernel, the merge, the word to the guards and the writes through
+    /// the kernel. Each shape of what the card wrote is timed written
+    /// whole (as before, `VICTORY_BACK_RUNS=0`) and in runs, on the same
+    /// bytes, and both must leave title memory and the copy as the oracle
+    /// says. Not timed: the fetch from the card, the card's own passes,
+    /// and `Shadow::card_changed`.
+    ///
+    /// The second shape is the one [`BACK_GAP`] is an estimate for: the
+    /// most runs a piece can have, each as short as a run gets. If it is
+    /// slower in runs than whole, the gap is too small for the machine.
+    #[test]
+    #[ignore = "a timing, not a check: run it alone and optimized, with --ignored --nocapture"]
+    fn back_timing() {
+        const PIECES: usize = 873;
+        fn ends(at: usize) -> bool {
+            !(16..PIECE - 16).contains(&at) || (PIECE / 2..PIECE / 2 + 16).contains(&at)
+        }
+        fn parted(at: usize) -> bool {
+            at % (BACK_CHUNK + BACK_GAP) < 8
+        }
+        fn sprinkled(at: usize) -> bool {
+            at % 1024 < 4
+        }
+        fn all(_: usize) -> bool {
+            true
+        }
+        let shapes = [
+            ("a few words at both ends and in the middle of each piece", ends as fn(usize) -> bool),
+            ("eight bytes every gap and chunk (the most runs a piece has)", parted as fn(usize) -> bool),
+            ("four bytes in every KiB (no gap: one write)", sprinkled as fn(usize) -> bool),
+            ("every byte", all as fn(usize) -> bool),
+        ];
+        let n = PIECES * PIECE;
+        let old = bytes(n);
+        // The title's own writes while the card ran: eight bytes in every
+        // piece.
+        let mut title = old.clone();
+        for piece in 0..PIECES {
+            for byte in &mut title[piece * PIECE + 40_000..][..8] {
+                *byte ^= 0x11;
+            }
+        }
+        let (mut side, mut memory) = (vec![0u8; n], vec![0u8; n]);
+        for (name, wrote) in shapes {
+            let mut gpu = old.clone();
+            for (at, byte) in gpu.iter_mut().enumerate() {
+                if wrote(at % PIECE) {
+                    *byte ^= 0xa5;
+                }
+            }
+            for apart in [false, true] {
+                let mut best = std::time::Duration::MAX;
+                let mut done = (0, 0);
+                for _ in 0..3 {
+                    side.copy_from_slice(&old);
+                    memory.copy_from_slice(&title);
+                    let to = memory.as_mut_ptr() as usize;
+                    let mut read = Vec::new();
+                    let (mut put, mut writes) = (0, 0);
+                    let started = std::time::Instant::now();
+                    for piece in 0..PIECES {
+                        let lo = piece * PIECE;
+                        let (gpu, held) = (&gpu[lo..lo + PIECE], &mut side[lo..lo + PIECE]);
+                        let Some(first) = first_difference(gpu, held) else {
+                            continue;
+                        };
+                        let last = last_difference(gpu, held).unwrap_or(first);
+                        let (gpu, held) = (&gpu[first..=last], &mut held[first..=last]);
+                        let read = scratch(&mut read, gpu.len());
+                        assert!(crate::host::read_into((to + lo + first) as *const u8, read));
+                        let runs = merge_card(gpu, held, read, apart);
+                        put += write_runs(to + lo + first, read, &runs);
+                        writes += runs.as_slice().len();
+                    }
+                    best = best.min(started.elapsed());
+                    done = (put, writes);
+                    let right = side.iter().zip(&memory).zip(gpu.iter().zip(&old).zip(&title)).all(|((s, m), ((g, o), t))| {
+                        let want = if g != o { g } else { t };
+                        s == want && m == want
+                    });
+                    assert!(right, "{name}");
+                }
+                println!(
+                    "{name}, written {}: {:.2} MB in {} writes, {:.1} ms for {PIECES} pieces (the best of three)",
+                    if apart { "in runs" } else { "whole" },
+                    done.0 as f64 / 1e6,
+                    done.1,
+                    best.as_secs_f64() * 1e3,
+                );
+            }
+        }
+    }
+}
+
 /// Host copies alive (also those only a list, a descriptor pass or a
 /// snapshot still holds) and the bytes of title memory they copy.
 static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
@@ -1868,7 +2462,9 @@ impl Shadow {
     /// command memory shares the big GPU heap with what shaders write), and
     /// putting back the copy's older bytes there broke the title's own
     /// records (a fence list read as -1, title+0x4e9b54a). Returns the bytes
-    /// written. The range must lie in ranges declared with
+    /// written: those of the runs that went into title memory
+    /// ([`back_in_runs`]), not all from the first byte the GPU changed in a
+    /// piece to the last. The range must lie in ranges declared with
     /// [`Shadow::writing`] and not yet done: `Host::execute` passes the
     /// union of a submission's ranges, each byte once, then calls
     /// [`Shadow::copy_back_done`].
@@ -1914,45 +2510,35 @@ impl Shadow {
             for &(at, n) in &differing {
                 self.changed(at, at + n);
             }
-            let mut title = vec![0u8; PIECE];
+            let apart = back_in_runs();
+            // Scratch for title memory, made when the first piece that
+            // differs asks for it: a range in which none does needs none
+            // (every range compared made and zeroed 64 KiB of it).
+            let mut title = Vec::new();
             for (at, n) in differing {
                 // SAFETY: inside the mapping; only the submitting thread
                 // writes it.
                 let host = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
                 let old = &before[at - from..at - from + n];
                 // From the first byte that differs to the last: title
-                // memory is read and written there only (a shader that sets
-                // a few words of a piece cost a read, a walk and a write of
-                // all 64 KiB of it).
+                // memory is read there only (a shader that sets a few words
+                // of a piece cost a read, a walk and a write of all 64 KiB
+                // of it), and written only in the runs of it that change
+                // ([`back_in_runs`]).
                 let Some(first) = first_difference(host, old) else {
                     continue;
                 };
                 let last = last_difference(host, old).unwrap_or(first);
                 let (at, n) = (at + first, last + 1 - first);
                 let (host, old) = (&mut host[first..=last], &old[first..=last]);
-                let title = &mut title[..n];
+                let title = scratch(&mut title, n);
                 if !crate::host::read_into((start + at) as *const u8, title) {
                     continue;
                 }
                 // Title memory with the GPU's bytes put in; the copy takes
-                // the title's bytes in turn.
-                // Without a branch, so the loop runs many bytes at a time:
-                // the GPU's byte where the copy's byte is not what it was
-                // before the submission, else the title's. (With the two
-                // searches above this was 44 ms a frame for 970 pieces.)
-                let mut differs = 0u8;
-                for ((t, h), o) in title.iter_mut().zip(host.iter_mut()).zip(old) {
-                    let gpu = if *h != *o { 0xffu8 } else { 0 };
-                    let merged = (*t & !gpu) | (*h & gpu);
-                    differs |= merged ^ *t;
-                    *t = merged;
-                    *h = merged;
-                }
-                if differs != 0 {
-                    crate::watch::writing(start + at, n);
-                    crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                    written += n;
-                }
+                // the title's bytes in turn ([`merge_copy`]).
+                let runs = merge_copy(host, old, title, apart);
+                written += write_runs(start + at, title, &runs);
             }
             // Our write shows as a title write at the copy's next refresh,
             // which copies those pages once more (some dozens of MB a
@@ -2533,10 +3119,13 @@ impl Shadow {
     /// the card's side holds at offset `at` on, in a piece the compare
     /// found differing. The bytes shaders wrote (those that differ from the
     /// CPU's side, which is what the card's side held when they started)
-    /// go into title memory, from the first to the last of them, as
-    /// [`Shadow::copy_back`] puts them; the CPU's side takes the result and
-    /// sends it up before the next submission. `title` is scratch memory.
-    /// Returns the bytes written to title memory.
+    /// go into title memory as [`Shadow::copy_back`] puts them: merged with
+    /// title memory from the first to the last of them, and written in the
+    /// runs of that stretch in which title memory changes
+    /// ([`back_in_runs`]). The CPU's side takes the result, all of the
+    /// stretch, and sends it up before the next submission. `title` is
+    /// scratch memory, kept as it is for the next piece. Returns the bytes
+    /// written to title memory.
     pub(crate) fn card_merge(&self, at: usize, gpu: &[u8], title: &mut Vec<u8>) -> usize {
         let start = self.start as usize;
         if self.card.is_none() || at + gpu.len() > self.len as usize {
@@ -2551,25 +3140,18 @@ impl Shadow {
         let last = last_difference(gpu, old).unwrap_or(first);
         let (at, n) = (at + first, last + 1 - first);
         let (gpu, old) = (&gpu[first..=last], &mut old[first..=last]);
-        title.clear();
-        title.resize(n, 0);
+        // Not filled first: the read writes every byte of it, or it is not
+        // looked at. (It was cleared and zeroed for every stretch: each
+        // frame, all the megabytes put back, once more.)
+        let title = scratch(title, n);
         let mut written = 0;
         if crate::host::read_into((start + at) as *const u8, title) {
             // As in `copy_back`: the card's byte where it is not what it
-            // was before the submission, else the title's.
-            let mut differs = 0u8;
-            for ((t, g), o) in title.iter_mut().zip(gpu).zip(old.iter_mut()) {
-                let wrote = if *g != *o { 0xffu8 } else { 0 };
-                let merged = (*t & !wrote) | (*g & wrote);
-                differs |= merged ^ *t;
-                *t = merged;
-                *o = merged;
-            }
-            if differs != 0 {
-                crate::watch::writing(start + at, n);
-                crate::host::write_mapped((start + at) as *mut u8, title.as_ptr(), n);
-                written = n;
-            }
+            // was before the submission, else the title's ([`merge_card`]),
+            // written in the runs of the stretch in which title memory
+            // changes ([`back_in_runs`]).
+            let runs = merge_card(gpu, old, title, back_in_runs());
+            written = write_runs(start + at, title, &runs);
         } else {
             // Title memory is not mapped there: the copy keeps what the
             // card wrote, as before.

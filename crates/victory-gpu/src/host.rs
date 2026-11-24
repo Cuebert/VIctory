@@ -1552,10 +1552,12 @@ pub(crate) fn poll_fetch_mode() {
     let Some(folder) = crate::capture::folder() else { return };
     let Ok(mut file) = std::fs::File::open(folder.join("fetch-mode.txt")) else { return };
     let mut byte = [0u8; 1];
-    if file.read_exact(&mut byte).is_err() || !matches!(byte[0], b'0' | b'1') {
+    if file.read_exact(&mut byte).is_err() || !matches!(byte[0], b'0'..=b'3') {
         return;
     }
-    let enabled = byte[0] == b'1';
+    let mode = byte[0] - b'0';
+    let enabled = mode & 1 != 0;
+    crate::shadow::set_back_run_trial(mode & 2 != 0);
     if JOIN_FETCHES.swap(enabled, Ordering::Relaxed) != enabled {
         tracing::info!(enabled, "changed adjacent readback copies");
     }
@@ -6081,9 +6083,18 @@ impl Host {
             }
             #[cfg(feature = "diagnostics")]
             if let Some((buffer, footprint)) = capture {
-                crate::capture::save_read_back(frame, &buffer, &footprint);
+                crate::capture::finish_frame(frame, buffer, footprint);
             }
             let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            #[cfg(feature = "diagnostics")]
+            if frame <= 900 {
+                static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *TRACE.get_or_init(|| std::env::var_os("VICTORY_PRESENT_TIMING").is_some()) {
+                    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+                    let time_us = START.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64;
+                    tracing::info!(frame, time_us, "intro present clock");
+                }
+            }
             p.meter.frame(p.hwnd);
             #[cfg(feature = "diagnostics")]
             return Some(probe.is_some_and(|b| crate::capture::black(&b)));

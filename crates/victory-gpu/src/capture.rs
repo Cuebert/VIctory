@@ -303,7 +303,81 @@ fn read_back_of(
     }
 }
 
+/// The copy has completed on the GPU. Move ownership of its dedicated
+/// readback resource to the encoder; the swap-chain buffers stay on the
+/// presenter. Keep at most two queued images and one in progress.
+pub(crate) fn finish_frame(
+    frame: u64,
+    buffer: ID3D12Resource,
+    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
+) {
+    type Frame = (u64, ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT);
+    static ENCODER: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<Frame>>> = std::sync::OnceLock::new();
+    let sender = ENCODER.get_or_init(|| {
+        if std::env::var_os("VICTORY_CAPTURE_SYNC").is_some() {
+            return None;
+        }
+        let (send, recv) = std::sync::mpsc::sync_channel::<Frame>(2);
+        std::thread::Builder::new().name("presented-frame-png".into()).spawn(move || {
+            for (frame, buffer, footprint) in recv {
+                save_read_back(frame, &buffer, &footprint);
+            }
+        }).ok().map(|_| send)
+    });
+    let work = (frame, buffer, footprint);
+    let (frame, buffer, footprint) = match sender {
+        Some(sender) => match sender.send(work) {
+            Ok(()) => return,
+            Err(error) => error.0,
+        },
+        None => work,
+    };
+    save_read_back(frame, &buffer, &footprint);
+}
+
 /// Saves a frame read back by [`read_back`] (8-bit color only).
+#[cfg(test)]
+#[test]
+#[ignore = "requires a Windows D3D12 adapter and a private VICTORY_CAPTURE folder"]
+fn async_present_capture_preserves_gpu_pixels_and_row_pitch() {
+    let host = crate::host::host().expect("D3D12 host required");
+    let folder = folder().expect("private fixture folder required");
+    let (width, height, pitch) = (8, 4, 256);
+    let mut source = vec![0x66u8; pitch * height];
+    for y in 0..height {
+        for x in 0..width {
+            let offset = y * pitch + x * 4;
+            source[offset..offset + 4].copy_from_slice(&[(x * 25) as u8, (y * 40) as u8, 201, 255]);
+        }
+    }
+    let (upload, ptr) = host.upload_buffer(source.len() as u64).unwrap();
+    let readback = host.read_back_buffer(source.len() as u64).unwrap();
+    let list = host.new_list().unwrap();
+    unsafe {
+        std::ptr::copy_nonoverlapping(source.as_ptr(), ptr, source.len());
+        list.list.CopyBufferRegion(&readback, 0, &upload, 0, source.len() as u64);
+    }
+    list.close();
+    host.execute(&[&list]);
+    save(740000, width as u32, height as u32, pitch, true, &source);
+    let reference = std::fs::read(folder.join("frame-740000.png")).unwrap();
+    let layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+        Offset: 0,
+        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM, Width: width as u32, Height: height as u32,
+            Depth: 1, RowPitch: pitch as u32,
+        },
+    };
+    finish_frame(740001, readback, layout);
+    let path = folder.join("frame-740001.png");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if std::fs::read(&path).ok().as_ref() == Some(&reference) { break; }
+        assert!(std::time::Instant::now() < deadline, "worker failed to produce byte-identical PNG");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
 pub(crate) fn save_read_back(
     frame: u64,
     buffer: &ID3D12Resource,
