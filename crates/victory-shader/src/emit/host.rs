@@ -915,6 +915,9 @@ pub enum View<'a> {
     /// An RGBA32F texture SRV with mip levels (width, height, levels,
     /// texels of each level in turn, level n `max(1, size >> n)` wide).
     Levels(u32, u32, u32, &'a [[f32; 4]]),
+    /// An RGBA32F cube SRV with mip levels (face size, levels, texels of
+    /// faces +x -x +y -y +z -z, each face's levels in turn).
+    CubeLevels(u32, u32, &'a [[f32; 4]]),
     /// An R32F texture SRV (width, height, texels), for comparison sampling.
     Depth(u32, u32, &'a [f32]),
     /// A raw buffer UAV of this many dwords, zeroed.
@@ -1157,28 +1160,33 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::Levels(..) | View::Depth(..) => {
-                        // (width, height, levels, format, texel bytes, texel data)
-                        let (w, h, levels, format, size, bytes) = match *v {
+                    View::Levels(..) | View::CubeLevels(..) | View::Depth(..) => {
+                        // (width, height, levels, faces, format, texel bytes, texel data)
+                        let (w, h, levels, faces, format, size, bytes) = match *v {
                             View::Levels(w, h, n, t) => {
                                 let b = std::slice::from_raw_parts(t.as_ptr().cast(), t.len() * 16);
-                                (w, h, n, DXGI_FORMAT_R32G32B32A32_FLOAT, 16, b)
+                                (w, h, n, 1u32, DXGI_FORMAT_R32G32B32A32_FLOAT, 16, b)
+                            }
+                            View::CubeLevels(w, n, t) => {
+                                let b = std::slice::from_raw_parts(t.as_ptr().cast(), t.len() * 16);
+                                (w, w, n, 6, DXGI_FORMAT_R32G32B32A32_FLOAT, 16, b)
                             }
                             View::Depth(w, h, t) => {
                                 let b = std::slice::from_raw_parts(t.as_ptr().cast(), t.len() * 4);
-                                (w, h, 1, DXGI_FORMAT_R32_FLOAT, 4, b)
+                                (w, h, 1, 1, DXGI_FORMAT_R32_FLOAT, 4, b)
                             }
                             _ => unreachable!(),
                         };
                         let mut desc = texture_as(w, h, D3D12_RESOURCE_FLAG_NONE, format);
                         desc.MipLevels = levels as u16;
+                        desc.DepthOrArraySize = faces as u16;
                         let tex = make(
                             D3D12_HEAP_TYPE_DEFAULT,
                             &desc,
                             D3D12_RESOURCE_STATE_COPY_DEST,
                         )?;
                         let mut from = 0;
-                        for level in 0..levels {
+                        for (face, level) in (0..faces).flat_map(|f| (0..levels).map(move |l| (f, l))) {
                             let (lw, lh) =
                                 ((w >> level).max(1) as usize, (h >> level).max(1) as usize);
                             let pitch = (lw * size).next_multiple_of(256);
@@ -1202,7 +1210,7 @@ impl Host {
                             src.Anonymous.PlacedFootprint.Footprint.Format = format;
                             src.Anonymous.PlacedFootprint.Footprint.RowPitch = pitch as u32;
                             let mut dst = subresource(&tex);
-                            dst.Anonymous.SubresourceIndex = level;
+                            dst.Anonymous.SubresourceIndex = level + face * levels;
                             list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
                             keep.push(upload);
                         }
@@ -1211,7 +1219,22 @@ impl Host {
                             D3D12_RESOURCE_STATE_COPY_DEST,
                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
                         )]);
-                        dev.CreateShaderResourceView(&tex, None, at);
+                        let cube = D3D12_SHADER_RESOURCE_VIEW_DESC {
+                            Format: format,
+                            ViewDimension: D3D12_SRV_DIMENSION_TEXTURECUBE,
+                            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+                            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                                TextureCube: D3D12_TEXCUBE_SRV {
+                                    MipLevels: levels,
+                                    ..Default::default()
+                                },
+                            },
+                        };
+                        dev.CreateShaderResourceView(
+                            &tex,
+                            (faces == 6).then_some(&cube as *const _),
+                            at,
+                        );
                         keep.push(tex);
                     }
                     View::RawUav(_) | View::HalfUav(_) => {

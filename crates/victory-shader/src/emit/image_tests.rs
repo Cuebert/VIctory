@@ -65,6 +65,8 @@ struct Mimg {
     d16: bool,
     /// A sample with implicit derivatives.
     implicit: bool,
+    /// On a cube image (else 2D).
+    cube: bool,
 }
 
 impl Mimg {
@@ -78,7 +80,7 @@ impl Mimg {
             0xF000_0000
                 | (self.op & 0x7F) << 18
                 | self.op >> 7
-                | 1 << 3
+                | (if self.cube { 3 } else { 1 }) << 3
                 | u32::from(self.dmask) << 8,
             2 | data << 8
                 | (rsrc / 4) << 16
@@ -99,6 +101,7 @@ fn op(name: &str) -> u32 {
                 a16: false,
                 d16: false,
                 implicit: false,
+                cube: false,
             };
             let code: Vec<u8> = i
                 .words()
@@ -120,6 +123,7 @@ fn mimg(name: &str, dmask: u8) -> Mimg {
         d16: false,
         implicit: name.starts_with("image_sample")
             && !name.split('_').any(|t| explicit.contains(&t)),
+        cube: false,
     }
 }
 
@@ -772,6 +776,61 @@ fn comparisons_and_comparison_gathers_match_per_texel_comparisons() {
     check(&host, &cases, || View::Depth(W, W, t), point(true));
 }
 
+/// Gradient samples of a cube take two derivatives per direction, those of
+/// the face coordinates (s and t in [1, 2] across a face), then s, t, the
+/// face and, for `_cl`, the clamp: eight address dwords for
+/// `image_sample_d_cl`. Every face and level of the cube holds its own
+/// value, so the texel read names the face and the level the derivatives
+/// picked: 2^n texels along s or along t on an 8-texel face is level n.
+#[test]
+fn cube_gradients_are_the_face_coordinates() {
+    let Some(host) = host() else { return };
+    const FACE: u32 = 8;
+    const LEVELS: u32 = 4;
+    let texels: Vec<[f32; 4]> = (0..6)
+        .flat_map(|face| {
+            (0..LEVELS).flat_map(move |n| {
+                let side = (FACE >> n) as usize;
+                std::iter::repeat_n([face as f32, n as f32, 0.0, 1.0], side * side)
+            })
+        })
+        .collect();
+    let texels = leak(texels);
+    let cube = |name: &str| Mimg {
+        cube: true,
+        ..mimg(name, 0xF)
+    };
+    let want = |face: usize, n: u32| [face as f32, n as f32, 0.0, 1.0].map(f32::to_bits);
+    // Lane l: face l mod 6 at its centre, derivatives of 2^n texels (n = l /
+    // 6 mod 3) along s in x and y (lanes below 18) or along t.
+    let lane = |l: usize| {
+        let (face, n) = (l % 6, (l / 6 % 3) as u32);
+        let g = f((1 << n) as f32 / FACE as f32);
+        let grads = if l < 18 { [g, 0, g, 0] } else { [0, g, 0, g] };
+        (face, n, grads)
+    };
+    let cases = [
+        case("cube d", cube("image_sample_d"), &[], |l| {
+            let (face, n, g) = lane(l);
+            let a = [g[0], g[1], g[2], g[3], f(1.5), f(1.5), f(face as f32)];
+            (a.to_vec(), want(face, n))
+        }),
+        // The form the title's cube gradient samples take: 8 dwords.
+        case("cube d_cl", cube("image_sample_d_cl"), &[], |l| {
+            let (face, n, g) = lane(l);
+            let clamp = (l / 3 % 4) as u32;
+            let a = [g[0], g[1], g[2], g[3], f(1.5), f(1.5), f(face as f32), f(clamp as f32)];
+            (a.to_vec(), want(face, n.max(clamp)))
+        }),
+        case("cube cd", cube("image_sample_cd"), &[], |l| {
+            let (face, n, g) = lane(l);
+            let a = [g[0], g[1], g[2], g[3], f(1.5), f(1.5), f(face as f32)];
+            (a.to_vec(), want(face, n))
+        }),
+    ];
+    check(&host, &cases, || View::CubeLevels(FACE, LEVELS, texels), point(false));
+}
+
 #[test]
 fn stores_of_some_channels_write_zero_to_the_others() {
     let Some(host) = host() else { return };
@@ -783,6 +842,7 @@ fn stores_of_some_channels_write_zero_to_the_others() {
             a16: false,
             d16,
             implicit: false,
+            cube: false,
         };
         // Lane l writes texel (l mod 8, l / 8) with channel k = l + k / 4.
         let value = |l: usize, k: usize| l as f32 + k as f32 / 4.0;
