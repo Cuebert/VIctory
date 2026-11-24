@@ -106,13 +106,13 @@ impl HostHeap {
                     return None;
                 }
             };
-            return Some(Self::with(
+            return Self::with(
                 host,
                 heap,
                 kind,
                 SAMPLERS - SAMPLER_DYNAMIC,
                 SAMPLER_DYNAMIC,
-            ));
+            );
         }
         let extra = if sampler { 0 } else { DYNAMIC };
         let (heap, count) = match make(count + extra) {
@@ -128,7 +128,7 @@ impl HostHeap {
                 return None;
             }
         };
-        Some(Self::with(host, heap, kind, count, extra))
+        Self::with(host, heap, kind, count, extra)
     }
 
     /// The host heap over `heap`: `count` title slots, then `extra` dynamic
@@ -139,7 +139,7 @@ impl HostHeap {
         kind: D3D12_DESCRIPTOR_HEAP_TYPE,
         count: u32,
         extra: u32,
-    ) -> Self {
+    ) -> Option<Self> {
         let sampler = kind == D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER;
         // SAFETY: a live heap.
         let (cpu, step) = unsafe {
@@ -151,12 +151,6 @@ impl HostHeap {
         tracing::debug!(count, sampler, "host descriptor heap");
         // SAFETY: a live shader-visible heap.
         let gpu = unsafe { heap.GetGPUDescriptorHandleForHeapStart().ptr };
-        GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
-            gpu,
-            u64::from(count + extra) * u64::from(step),
-            u64::from(step),
-            sampler,
-        ));
         let h = HostHeap {
             heap,
             cpu,
@@ -177,8 +171,14 @@ impl HostHeap {
             tracing::warn!(error = %e, "host descriptor heap not made null");
             return None;
         }
+        GPU_RANGES.lock().unwrap_or_else(|e| e.into_inner()).push((
+            gpu,
+            u64::from(count + extra) * u64::from(step),
+            u64::from(step),
+            sampler,
+        ));
         tracing::debug!(ms = started.elapsed().as_millis(), "host descriptor heap made null");
-        h
+        Some(h)
     }
 
     /// Makes the first `total` slots null: one null slot in a CPU-side heap,
