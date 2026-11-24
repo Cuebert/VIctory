@@ -62,7 +62,9 @@ const PORTABLE_VIEWS: u32 = 1_000_000;
 /// Slots past the title's in a view heap, for tables a draw needs made
 /// afresh (constant buffers copied per draw). A list holds the slots it
 /// took until it is reset (its submissions have run) or released.
-const DYNAMIC: u32 = 1 << 16;
+/// 2^16 ran out seconds into the world (every world run on an RX 9070 XT,
+/// each a device removal shortly after; #59).
+const DYNAMIC: u32 = 1 << 18;
 
 impl HostHeap {
     pub(crate) fn new(sampler: bool, count: u32) -> Option<Self> {
@@ -207,26 +209,18 @@ impl HostHeap {
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
         let (next, taken) = &mut *guard;
         let n = n as usize;
-        // Search from `next` on, then from the start.
-        let starts = (*next as usize..DYNAMIC as usize).chain(0..*next as usize);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
-        let Some(first) = found else {
+        let Some(first) = free_table(taken, *next as usize, n) else {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
+            ONCE.call_once(|| {
+                let (free, longest) = free_space(taken);
+                tracing::warn!(
+                    n,
+                    cap = taken.len(),
+                    free,
+                    longest,
+                    "no free dynamic descriptor slots: a table is not made"
+                );
+            });
             return None;
         };
         taken[first..first + n].fill(true);
@@ -374,6 +368,34 @@ impl HostHeap {
     }
 }
 
+/// Total free slots and the longest contiguous run in the physical heap.
+fn free_space(taken: &[bool]) -> (usize, usize) {
+    let mut free = 0;
+    let mut longest = 0;
+    for gap in taken.split(|&held| held) {
+        free += gap.len();
+        longest = longest.max(gap.len());
+    }
+    (free, longest)
+}
+
+/// Try each possible table start from the cursor, then from slot zero.
+/// A table may cross the cursor on the second pass, but must fit in the heap.
+fn free_table(taken: &[bool], cursor: usize, n: usize) -> Option<usize> {
+    let end = taken.len().checked_sub(n)? + 1;
+    let split = cursor.min(end);
+    for starts in [split..end, 0..split] {
+        let mut first = starts.start;
+        while first < starts.end {
+            match taken[first..first + n].iter().position(|&held| held) {
+                Some(offset) => first += offset + 1,
+                None => return Some(first),
+            }
+        }
+    }
+    None
+}
+
 /// Logs `what` the first time it happens.
 macro_rules! once {
     ($($arg:tt)*) => {{
@@ -470,6 +492,15 @@ fn unordered_range(base: u64, words: &[u32; 10]) -> Option<(u64, u64)> {
     ))
 }
 
+/// Whether a raw buffer view may start at element `first` (4 bytes each):
+/// the host wants 16-byte aligned starts, the console only 4, and refuses
+/// the call (removing the device) for the rest.
+/// shortcut: a view the host refuses reads nothing (a null view); starting
+/// it 16 bytes lower would need the shader to add the difference.
+fn raw_start_fits(first: u64) -> bool {
+    first.is_multiple_of(4)
+}
+
 /// The host resource a slot made by [`make`] views, if any.
 type Kept = Option<ID3D12Resource>;
 
@@ -493,6 +524,11 @@ fn buffer_srv(
         return None;
     }
     buffer.FirstElement += offset / element;
+    if buffer.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0 && !raw_start_fits(buffer.FirstElement) {
+        let first = buffer.FirstElement;
+        once!(first, "raw buffer view not on 16 bytes of its host copy");
+        return None;
+    }
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
     unsafe {
@@ -535,6 +571,14 @@ fn buffer_uav(
         return None;
     }
     buffer.FirstElement += offset / element;
+    if buffer.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0 && !raw_start_fits(buffer.FirstElement) {
+        let first = buffer.FirstElement;
+        once!(
+            first,
+            "raw unordered buffer view not on 16 bytes of its host copy"
+        );
+        return None;
+    }
     buffer.CounterOffsetInBytes = 0;
     let host = host()?;
     // SAFETY: a live buffer and a slot of our heap.
@@ -734,9 +778,13 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
 fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
     let Some(host) = host() else { return };
     let is_buffer = |r: &usize| crate::resource::buffer_bytes(*r as crate::object::This).is_some();
-    let buffer = match view {
-        View::Unordered(r, _, desc) => is_buffer(r) || desc.is_some_and(|d| d[1] == 1),
-        View::Placed(true, resource, _) => resource[0] == 1,
+    // Unordered views: whether a buffer, and the title's view dimension.
+    let (buffer, dimension) = match view {
+        View::Unordered(r, _, desc) => (
+            is_buffer(r) || desc.is_some_and(|d| d[1] == 1),
+            desc.map(|d| d[1]),
+        ),
+        View::Placed(true, resource, desc) => (resource[0] == 1, Some(desc[1])),
         // Shader views of buffers read nothing through a null buffer view:
         // a null 2D view where the shader expects a buffer is a mismatch
         // the hardware does not survive in general (GPU-based validation
@@ -758,14 +806,14 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
         }
         _ => return null_view(at),
     };
-    let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
-        Format: DXGI_FORMAT_R32_UINT,
-        ViewDimension: if buffer {
-            D3D12_UAV_DIMENSION_BUFFER
-        } else {
-            D3D12_UAV_DIMENSION_TEXTURE2D
-        },
-        ..Default::default()
+    let desc = if buffer {
+        D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            Format: DXGI_FORMAT_R32_UINT,
+            ViewDimension: D3D12_UAV_DIMENSION_BUFFER,
+            ..Default::default()
+        }
+    } else {
+        null_uav_desc(dimension)
     };
     // SAFETY: a slot of our heap; a null resource is allowed with a desc.
     unsafe {
@@ -776,6 +824,46 @@ fn null_for(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) {
             at,
         )
     };
+}
+
+/// A null texture UAV of the title's view dimension (1D, 1D or 2D arrays,
+/// 3D), 2D if it names none: a 2D null view where the shader writes a 3D
+/// texture is a mismatch GPU-based validation reports (the world's wind
+/// field, CS_CopyWindFieldBeforeUpdateWithSmooth, 2026-11-24).
+fn null_uav_desc(dimension: Option<u32>) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
+    let mut desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+        Format: DXGI_FORMAT_R32_UINT,
+        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+        ..Default::default()
+    };
+    match dimension.map(|d| D3D12_UAV_DIMENSION(d as i32)) {
+        Some(D3D12_UAV_DIMENSION_TEXTURE1D) => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1D;
+        }
+        Some(D3D12_UAV_DIMENSION_TEXTURE1DARRAY) => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE1DARRAY;
+            desc.Anonymous.Texture1DArray = D3D12_TEX1D_ARRAY_UAV {
+                ArraySize: 1,
+                ..Default::default()
+            };
+        }
+        Some(D3D12_UAV_DIMENSION_TEXTURE2DARRAY) => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2DARRAY;
+            desc.Anonymous.Texture2DArray = D3D12_TEX2D_ARRAY_UAV {
+                ArraySize: 1,
+                ..Default::default()
+            };
+        }
+        Some(D3D12_UAV_DIMENSION_TEXTURE3D) => {
+            desc.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE3D;
+            desc.Anonymous.Texture3D = D3D12_TEX3D_UAV {
+                WSize: u32::MAX,
+                ..Default::default()
+            };
+        }
+        _ => {}
+    }
+    desc
 }
 
 /// A buffer view that reads zeros (raw, as translated shaders mostly read
@@ -856,6 +944,70 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 mod tests {
     use super::*;
 
+    /// A null texture UAV keeps the title's dimension (3D for the world's
+    /// wind field), and is 2D when the title names none.
+    #[test]
+    fn null_uavs_keep_the_titles_dimension() {
+        let d = null_uav_desc(Some(8));
+        assert_eq!(d.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE3D);
+        // SAFETY: the member the dimension names.
+        assert_eq!(unsafe { d.Anonymous.Texture3D.WSize }, u32::MAX);
+        let d = null_uav_desc(Some(5));
+        assert_eq!(d.ViewDimension, D3D12_UAV_DIMENSION_TEXTURE2DARRAY);
+        // SAFETY: the member the dimension names.
+        assert_eq!(unsafe { d.Anonymous.Texture2DArray.ArraySize }, 1);
+        let dimension = |d| null_uav_desc(d).ViewDimension;
+        assert_eq!(dimension(Some(2)), D3D12_UAV_DIMENSION_TEXTURE1D);
+        assert_eq!(dimension(Some(4)), D3D12_UAV_DIMENSION_TEXTURE2D);
+        assert_eq!(dimension(None), D3D12_UAV_DIMENSION_TEXTURE2D);
+        // Multisampled UAVs need a cap; they stay 2D.
+        assert_eq!(dimension(Some(6)), D3D12_UAV_DIMENSION_TEXTURE2D);
+    }
+
+    /// A null 3D UAV made on the real device leaves it alive.
+    #[test]
+    fn null_3d_uav_is_accepted_by_the_device() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let view = View::Unordered(0, 0, Some([28, 8, 0, 0, 0, 0, 0, 0, 0, 0]));
+        null_for(&view, heap.cpu(0));
+        // SAFETY: a plain device query.
+        assert!(unsafe { host.device.GetDeviceRemovedReason() }.is_ok());
+    }
+
+    #[test]
+    fn free_space_counts_separate_runs_at_the_heap_ends() {
+        assert_eq!(free_space(&[true; 8]), (0, 0));
+        assert_eq!(free_space(&[false; 8]), (8, 8));
+        let fragmented = [false, false, true, false, true, false, false, false];
+        assert_eq!(free_space(&fragmented), (6, 3));
+    }
+
+    #[test]
+    fn free_table_chooses_the_first_contiguous_fit_in_cursor_order() {
+        for mask in 0u16..256 {
+            let taken: [bool; 8] = std::array::from_fn(|slot| mask & (1 << slot) != 0);
+            for cursor in 0..taken.len() {
+                for n in 1..=taken.len() {
+                    let expected = (cursor..taken.len()).chain(0..cursor).find(|&start| {
+                        taken
+                            .get(start..start + n)
+                            .is_some_and(|table| table.iter().all(|&held| !held))
+                    });
+                    assert_eq!(
+                        free_table(&taken, cursor, n),
+                        expected,
+                        "{mask:#x} {cursor} {n}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn dynamic_slots_are_held_until_released() {
@@ -870,5 +1022,25 @@ mod tests {
         heap.release(a, 50);
         assert_eq!(heap.dynamic(50), Some(4));
         assert_eq!(heap.dynamic(40), Some(4 + DYNAMIC - 40));
+    }
+
+    #[test]
+    fn a_free_table_can_straddle_the_search_cursor() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        let left = heap.dynamic(4).unwrap();
+        let right = heap.dynamic(5).unwrap();
+        let tail = heap.dynamic(DYNAMIC - 9).unwrap();
+
+        heap.release(left, 4);
+        assert_eq!(heap.dynamic(4), Some(left)); // cursor now separates the two tables
+        heap.release(right, 5);
+        heap.release(left, 4);
+        assert_eq!(heap.dynamic(9), Some(left));
+        assert_eq!(heap.dynamic(1), None, "the tail is still held");
+
+        heap.release(tail, DYNAMIC - 9);
+        assert_eq!(heap.dynamic(DYNAMIC - 9), Some(tail));
     }
 }
