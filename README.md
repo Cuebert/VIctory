@@ -4,6 +4,10 @@ On 24 November 2026, cuebert independently reproduced a sunlit prison yard on Wi
 
 The underlying VIctory engine is the work of Marvisak and the VIctory contributors. The sunlit world already rendered on the fxceless fork. Our original run added guarded file access, input support and GPU checks to that baseline. The changes and measurements below followed on separate builds. [VIctory](https://github.com/Marvisak/VIctory) · [Exact fxceless baseline](https://github.com/fxceless/victory-fork/commit/16849898f3282c4a7189b1557289c194bc720052)
 
+## Latest field report (25 November 2026)
+
+New measurements from isolated local builds, outside the source revisions listed below, are documented in the [bilingual evidence report](https://cuebert.github.io/gta6-progress/en/evidence.html#g65-prison). It records a Series S prison run with 5.648 native frames/s over 180 stationary intervals and separately verified movement from the yard into the cell; a different stationary river sample with 6.004 native presentation updates/s and 6.052 changing window images/s; and a `Follow the plane` boat comparison across different builds, not a same-hardware A/B. An experimental title ray-tracing builder activated all 53 host pipelines and ran 36 distinct stages, then exited before controllable boat input; correct RT lighting and playable speed remain unverified. An optional quad path reduced measured green excess from 41.0% to 0.03%, with no proven speed gain and the first boat hull still obscured. The report includes native game captures and source attribution; these results do not imply that the isolated test builds are present in this repository revision.
+
 | Tested source | Observation |
 | --- | --- |
 | [Original gameplay run](https://github.com/Cuebert/VIctory/commit/91a836d7fe9eba32203ba596768408e3bb02ba80) | The mission sequence and screenshot above came from this build. A separate timing window in the same run recorded 300 game-frame intervals in 119.636 seconds, or 2.51 fps. Characters and shaded interiors often appeared very dark. |
