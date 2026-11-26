@@ -8,4 +8,4 @@ The local candidate admitted all 53 RT builder pipelines and presented a station
 
 A one-present hull probe found different HDR values before the selected indirect-light stage `1cd9`; the stage left both sampled 3×3 blocks unchanged. The sampled base centers were equal and depths close, but those taps were fenced later, so this does not establish a causal chain through those passes.
 
-The repository declares GPL-3.0-or-later; this patch is distributed under that license. Upstream [VIctory PR #150](https://github.com/Marvisak/VIctory/pull/150) concerns DualSense HID input and is unrelated; this patch does not copy its implementation. No binaries, title assets, captures, logs, saves or local launch scripts are included.
+The repository declares GPL-3.0-or-later. The texture-readback dependency change and its regression test are adapted from gomeaw’s [upstream VIctory PR #150](https://github.com/avatarmanz/VIctory-7900XTX/pull/150), under compatible GPL terms; the write-watch and visual-sample diagnostics are additions in this patch. No binaries, title assets, captures, logs, saves or local launch scripts are included.
