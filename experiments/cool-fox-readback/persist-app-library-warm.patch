@@ -1,0 +1,229 @@
+diff --git a/apps/victory/src/main.rs b/apps/victory/src/main.rs
+--- a/apps/victory/src/main.rs
++++ b/apps/victory/src/main.rs
+@@ -123,6 +123,9 @@
+         /// Only the pipelines earlier runs drew with.
+         #[arg(long)]
+         used: bool,
++        /// Save a bounded batch in this cache's native application pipeline library.
++        #[arg(long)]
++        persist_app_library: bool,
+         /// (What the processes it starts are given.)
+         #[arg(long, hide = true)]
+         these: Option<String>,
+@@ -215,7 +218,14 @@
+         }
+         Command::Shaders { paths, jobs } => translate::precompile(paths, jobs),
+         #[cfg(windows)]
+-        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
++        Command::Warm { jobs, limit, again, used, these, persist_app_library } => {
++            if persist_app_library {
++                anyhow::ensure!(these.is_none() && !again, "Persistent replay has its own repeatable plan");
++                warm::persist_application_library(jobs, limit, used)
++            } else {
++                warm::run(jobs, limit, again, used, these)
++            }
++        }
+         Command::Run {
+             exe,
+             unimplemented,
+diff --git a/apps/victory/src/warm.rs b/apps/victory/src/warm.rs
+--- a/apps/victory/src/warm.rs
++++ b/apps/victory/src/warm.rs
+@@ -127,6 +127,70 @@
+     Ok(())
+ }
+ 
++/// Build or reopen a small private application library in one device process.
++pub fn persist_application_library(jobs: Option<usize>, limit: Option<usize>, used: bool) -> Result<()> {
++    anyhow::ensure!(jobs.unwrap_or(1) == 1, "Persistent replay uses one process");
++    let limit = limit.context("Supply a persistent replay limit from 1 to 40")?;
++    anyhow::ensure!((1..=AT_ONCE).contains(&limit), "Supply a persistent replay limit from 1 to 40");
++    let dir = folder()?;
++    let lock = std::fs::OpenOptions::new()
++        .create(true).truncate(false).write(true).open(dir.join("warm-app-library.lock"))?;
++    lock.try_lock().context("This private application library is in use")?;
++    known::use_translations(dir.with_file_name("shaders"));
++    known::use_application_library(dir.clone());
++
++    let configuration = [
++        "VICTORY_D3D12_ADAPTER", "VICTORY_EXPECT_NVIDIA_LUID",
++        "VICTORY_FOX_WATER_TRANSMISSION_WAVE32", "VICTORY_PIXEL_QUAD_DPP8",
++        "VICTORY_HOST_MAX_WAVE", "VICTORY_DXIL",
++    ].map(|name| (name, std::env::var(name).unwrap_or_default()));
++    let id = format!("{} {configuration:?}", known::fingerprint());
++    let identity_path = dir.join("warm-app-library-id.txt");
++    match std::fs::read_to_string(&identity_path) {
++        Ok(old) => anyhow::ensure!(old == id, "Application library configuration changed"),
++        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
++            anyhow::ensure!(!dir.join("host-pipelines.bin").exists() && !dir.join("host-pipelines.next").exists(),
++                "Persistent replay needs its own application library folder");
++            std::fs::OpenOptions::new().create_new(true).write(true).open(identity_path)?.write_all(id.as_bytes())?;
++        }
++        Err(err) => return Err(err.into()),
++    }
++
++    let reopening = dir.join("host-pipelines.bin").is_file() || dir.join("host-pipelines.next").is_file();
++    let keys = known::keys(&dir);
++    let early = std::fs::read_to_string(dir.join("early-pipelines.txt"))?;
++    let early: HashSet<_> = early.lines().collect();
++    let mut selected: Vec<_> = (0..keys.len())
++        .filter(|&n| !used || early.contains(keys[n].as_str()))
++        .collect();
++    selected.sort_by_key(|&n| (!early.contains(keys[n].as_str()), &keys[n]));
++    selected.truncate(limit);
++    anyhow::ensure!(!selected.is_empty(), "No recipes matched the persistent replay plan");
++
++    let mut accepted = 0;
++    let mut completed = 0;
++    let mut previous = known::application_library_counts();
++    known::make(&dir, &selected, |n, result| {
++        match result {
++            Some((ms, there)) => {
++                accepted += usize::from(there);
++                completed += 1;
++                let (made, loaded) = known::application_library_counts();
++                let (new_made, new_loaded) = (made - previous.0, loaded - previous.1);
++                previous = (made, loaded);
++                println!("app-library recipe {n} {} ms={ms:.2} accepted={there} made={new_made} loaded={new_loaded}", keys[n]);
++            }
++            None => println!("app-library building recipe {n} {}", keys[n]),
++        }
++    });
++    let (made, loaded, saved) = known::finish_application_library();
++    println!("app-library completed={completed} accepted={accepted} made={made} loaded={loaded} saved={saved}");
++    anyhow::ensure!(!reopening || loaded != 0, "Existing application library produced no native loads");
++    anyhow::ensure!(completed == selected.len() && accepted != 0 && saved,
++        "Persistent application pipeline replay did not retain any accepted recipes");
++    Ok(())
++}
++
+ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+     m.lock().unwrap_or_else(|e| e.into_inner())
+ }
+diff --git a/crates/victory-gpu/src/pipeline/known.rs b/crates/victory-gpu/src/pipeline/known.rs
+--- a/crates/victory-gpu/src/pipeline/known.rs
++++ b/crates/victory-gpu/src/pipeline/known.rs
+@@ -212,6 +212,25 @@
+ /// not used: what is made here is the driver's to keep).
+ pub fn use_translations(dir: PathBuf) {
+     crate::shader_cache::use_shader_cache(dir);
++}
++
++/// Use the native application library for an isolated, serial replay.
++pub fn use_application_library(dir: PathBuf) {
++    super::library::use_pipeline_cache(dir);
++}
++
++/// Accumulated native pipeline builds and successful named library loads.
++pub fn application_library_counts() -> (u64, u64) {
++    use std::sync::atomic::Ordering::Relaxed;
++    use super::library::{LOADED, MADE};
++    (MADE.load(Relaxed), LOADED.load(Relaxed))
++}
++
++/// Save compiled pipelines only. Original recipes and usage hints remain input.
++pub fn finish_application_library() -> (u64, u64, bool) {
++    let (made, loaded) = application_library_counts();
++    let saved = if made == 0 { loaded != 0 } else { super::library::save_compiled_only() };
++    (made, loaded, saved)
+ }
+ 
+ /// Makes the host pipelines of those of `which` (numbers in the file) and
+diff --git a/crates/victory-gpu/src/pipeline/library.rs b/crates/victory-gpu/src/pipeline/library.rs
+--- a/crates/victory-gpu/src/pipeline/library.rs
++++ b/crates/victory-gpu/src/pipeline/library.rs
+@@ -572,19 +572,27 @@
+ /// Writes the library and the early list if pipelines were added since the
+ /// last save and `SAVE_EVERY` has passed (or `now`).
+ pub(crate) fn save(now: bool) {
++    save_inner(now, true);
++}
++
++pub(super) fn save_compiled_only() -> bool {
++    save_inner(true, false)
++}
++
++fn save_inner(now: bool, record_usage: bool) -> bool {
+     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+-    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
++    let (Some(dir), Some(library)) = (DIR.get(), library()) else { return false };
+     {
+         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+         if !now && last.is_some_and(|t| t.elapsed() < SAVE_EVERY) {
+-            return;
++            return false;
+         }
+         *last = Some(std::time::Instant::now());
+     }
+     if let Err(e) = std::fs::create_dir_all(dir) {
+         tracing::warn!(error = %e, "host pipeline library not saved");
+-        return;
++        return false;
+     }
+     let tmp = dir.join(LIBRARY_FILE).with_extension("tmp");
+     // The bytes of the library written to `tmp`; 0 when no pipeline was
+@@ -596,8 +604,9 @@
+         // No store between asking the size and writing; loads go on.
+         let _alone = library.saving.write().unwrap_or_else(|e| e.into_inner());
+         let added = library.added.load(Ordering::Relaxed);
+-        if !USED_CHANGED.swap(false, Ordering::Relaxed) && added == 0 {
+-            return;
++        let usage_changed = record_usage && USED_CHANGED.swap(false, Ordering::Relaxed);
++        if !usage_changed && added == 0 {
++            return false;
+         }
+         if added == 0 {
+             0
+@@ -608,16 +617,13 @@
+             if let Err(e) = serialise(&library.library, &tmp, size) {
+                 tracing::warn!(error = %e, "host pipeline library not serialised");
+                 let _ = std::fs::remove_file(&tmp);
+-                return;
++                return false;
+             }
+             library.added.store(0, Ordering::Relaxed);
+             SAVED.store(size as u64, Ordering::Relaxed);
+             size
+         }
+     };
+-    // Through `used`: a process that asked for none yet (`victory shaders`)
+-    // must not write the earlier runs' list over with nothing.
+-    let used: Vec<String> = used().iter().flatten().cloned().collect();
+     let library_written = if bytes > 0 { replace_library(dir, &tmp) } else { Ok(()) };
+     if bytes > 0 && library_written.is_ok() {
+         // In place unless the system refused and the new one waits beside it.
+@@ -633,6 +639,17 @@
+             )
+         });
+     }
++    if !record_usage {
++        return match library_written {
++            Ok(()) => bytes > 0,
++            Err(e) => {
++                tracing::warn!(error = %e, "host pipeline library not saved");
++                false
++            }
++        };
++    }
++    // Leave the earlier runs' used list in place until we have read it.
++    let used: Vec<String> = used().iter().flatten().cloned().collect();
+     let slow: Vec<String> = slow_ones().iter().flatten().map(|(key, ms)| format!("{key} {ms}")).collect();
+     let written = library_written
+         .and_then(|()| write_atomically(&dir.join(SLOW_FILE), slow.join("\n").as_bytes()))
+@@ -646,8 +663,12 @@
+             started_early = EARLY.load(Ordering::Relaxed),
+             "host pipeline library saved"
+         ),
+-        Err(e) => tracing::warn!(error = %e, "host pipeline library not saved"),
+-    }
++        Err(e) => {
++            tracing::warn!(error = %e, "host pipeline library not saved");
++            return false;
++        }
++    }
++    true
+ }
+ 
+ /// Writes the library's `size` serialised bytes to the file `tmp`: through
