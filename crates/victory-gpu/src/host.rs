@@ -3649,6 +3649,29 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
 }
 
+/// Group independent uploads when at least four buffers need both a copy and a hash.
+/// An entry without copied ranges still receives its first-use hash.
+fn batch_card_hashes(dirty: &[Declared]) -> bool {
+    const MIN_HOLDERS: usize = 4;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("VICTORY_CARD_SYNC_BATCH").is_some_and(|v| v == "1"))
+        || dirty.len() < MIN_HOLDERS
+    {
+        return false;
+    }
+    let mut seen = std::collections::HashSet::with_capacity(dirty.len());
+    let mut holders = 0;
+    for (shadow, ranges) in dirty {
+        if !seen.insert(std::sync::Arc::as_ptr(shadow)) {
+            return false;
+        }
+        if !ranges.is_empty() && shadow.has_card_hash() {
+            holders += 1;
+        }
+    }
+    holders >= MIN_HOLDERS
+}
+
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
 /// air, if there are any, and is set when they are settled. Whether it
 /// did; if not the caller sets the fence now.
@@ -4859,11 +4882,44 @@ impl Host {
                 (|| -> windows::core::Result<()> {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
+                    let batched = batch_card_hashes(&dirty);
                     let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Sync);
                     #[cfg(feature = "diagnostics")]
                     let shot_span = crate::shot::span_begin(list);
                     // Where the next range lies in the landing buffer.
                     let mut at = 0u64;
+                    struct HashWork<'a> {
+                        shadow: &'a Arc<crate::shadow::Shadow>,
+                        ranges: &'a [(usize, usize)],
+                        before: ID3D12Resource,
+                        size: u64,
+                    }
+                    let mut hash_work = if batched { Vec::with_capacity(dirty.len()) } else { Vec::new() };
+                    let hash_barrier = |job: &HashWork<'_>| {
+                        transition(&job.shadow.buffer, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
+                    };
+                    let bind_hash = || {
+                        list.SetComputeRootSignature(&work.root);
+                        list.SetPipelineState(&work.pso);
+                        list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
+                    };
+                    let hash = |job: &HashWork<'_>| {
+                        list.SetComputeRootShaderResourceView(1, job.shadow.buffer.GetGPUVirtualAddress());
+                        list.SetComputeRootUnorderedAccessView(2, job.before.GetGPUVirtualAddress());
+                        let runs = if whole.iter().any(|shadow| Arc::ptr_eq(shadow, job.shadow)) {
+                            vec![job.shadow.card_run(0, usize::MAX)]
+                        } else {
+                            job.ranges.iter().map(|&(a, b)| job.shadow.card_run(a, b)).collect()
+                        };
+                        let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
+                        CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
+                        CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
+                        for run in runs {
+                            let constants = [run.first, run.skew, job.shadow.card_hashed().unwrap_or(job.size) as u32, run.pieces, 0, 0];
+                            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+                            list.Dispatch(card_compare_groups(run.pieces), 1, 1);
+                        }
+                    };
                     for (shadow, ranges) in &dirty {
                         let Some((staging, before, size)) = shadow.card_sides() else {
                             continue;
@@ -4886,31 +4942,25 @@ impl Host {
                         // hashed again, all of them the first time; the
                         // compare after the lists hashes the declared
                         // pieces and flags those whose hash is another.
-                        if !ranges.is_empty() {
-                            list.ResourceBarrier(&[transition(
-                                &shadow.buffer,
-                                D3D12_RESOURCE_STATE_COPY_DEST,
-                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
-                            )]);
-                        }
-                        list.SetComputeRootSignature(&work.root);
-                        list.SetPipelineState(&work.pso);
-                        list.SetComputeRootShaderResourceView(1, shadow.buffer.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(2, before.GetGPUVirtualAddress());
-                        list.SetComputeRootUnorderedAccessView(3, work.differs.0.GetGPUVirtualAddress());
-                        let runs: Vec<crate::shadow::CardSpan> = if whole.iter().any(|s| Arc::ptr_eq(s, shadow)) {
-                            vec![shadow.card_run(0, usize::MAX)]
+                        let job = HashWork { shadow, ranges, before, size };
+                        if batched {
+                            hash_work.push(job);
                         } else {
-                            ranges.iter().map(|&(a, b)| shadow.card_run(a, b)).collect()
-                        };
-                        // The same pieces in fewer passes (`rehash_runs`).
-                        let runs = if rehash_runs() { crate::shadow::joined_piece_runs(runs) } else { runs };
-                        CARD_PASSES[0].fetch_add(runs.len() as u64, Ordering::Relaxed);
-                        CARD_PASSES[1].fetch_add(runs.iter().map(|r| u64::from(r.pieces)).sum::<u64>(), Ordering::Relaxed);
-                        for run in runs {
-                            let constants = [run.first, run.skew, shadow.card_hashed().unwrap_or(size) as u32, run.pieces, 0, 0];
-                            list.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
-                            list.Dispatch(card_compare_groups(run.pieces), 1, 1);
+                            if !ranges.is_empty() {
+                                list.ResourceBarrier(&[hash_barrier(&job)]);
+                            }
+                            bind_hash();
+                            hash(&job);
+                        }
+                    }
+                    if !hash_work.is_empty() {
+                        let barriers: Vec<_> = hash_work.iter().filter(|job| !job.ranges.is_empty()).map(hash_barrier).collect();
+                        if !barriers.is_empty() {
+                            list.ResourceBarrier(&barriers);
+                        }
+                        bind_hash();
+                        for job in &hash_work {
+                            hash(job);
                         }
                     }
                     crate::cardmeter::end(list, timed);

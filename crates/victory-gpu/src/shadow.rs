@@ -3842,6 +3842,11 @@ impl Shadow {
         }
     }
 
+    /// The before-hash buffer is made once under the submission lock.
+    pub(crate) fn has_card_hash(&self) -> bool {
+        self.card.as_ref().is_some_and(|card| card.before.lock().unwrap_or_else(|e| e.into_inner()).is_some())
+    }
+
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
     /// card side's bytes from before if made yet, and their size.
     pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
