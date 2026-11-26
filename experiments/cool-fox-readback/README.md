@@ -9,3 +9,9 @@ The local candidate admitted all 53 RT builder pipelines and presented a station
 A one-present hull probe found different HDR values before the selected indirect-light stage `1cd9`; the stage left both sampled 3×3 blocks unchanged. The sampled base centers were equal and depths close, but those taps were fenced later, so this does not establish a causal chain through those passes.
 
 The repository declares GPL-3.0-or-later. The texture-readback dependency change and its regression test are adapted from gomeaw’s [upstream VIctory PR #150](https://github.com/avatarmanz/VIctory-7900XTX/pull/150), under compatible GPL terms; the write-watch and visual-sample diagnostics are additions in this patch. No binaries, title assets, captures, logs, saves or local launch scripts are included.
+
+## Separate Series S bridge row
+
+A separate D508 run on RTX 5090 adapter 0 used the Series S profile at native 1920×1080 on the stationary bridge. The RT-on arm admitted all 53 RT builder pipelines; read/build dispatches were logged. Seven settled host intervals averaged 50.914 ms (19.64 FPS equivalent, 19.2–20.1 FPS, 3,510.7 draws), with zero compiling pipelines and about one host/two indirect drops per sample. The RT-off control is separate and covers only three intervals: 42.4 ms (23.58 FPS equivalent), about 3,448 draws, 75–78 missing host pipelines and 481–494 indirect drops.
+
+These arms executed unequal work, so this is not an isolated RT-cost or render-parity comparison. There was no same-scene alternate native-resolution or movement comparison; later water-pass and input behavior remain unresolved. This row is from the separate D508 runtime, not a benchmark of the readback patch.
