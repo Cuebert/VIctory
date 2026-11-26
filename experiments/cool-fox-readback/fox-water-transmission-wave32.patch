@@ -1,0 +1,300 @@
+From: Codex
+Subject: [PATCH] shader: opt-in Wave32 lowering for two tiled water programs
+
+Adapt the local 2e01ab4 Wave32 transmission and deterministic fxceless
+transmission-bounds overlays to the Fox translator. The earlier wave-wide
+selection follows fxceless/victory-fork #823 (Felix2180). GPL-3.0-or-later.
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -440,6 +440,9 @@
+ ) -> Result<HostShader, ShaderError> {
+     // (what an earlier program's lowering on this thread left behind)
+     lower::take_needs();
++    if let Some(init) = water_transmission_bounds(c, native) {
++        return emit_water_transmission(c, native, p, st, init);
++    }
+     let original = emit_program(c, native, p, st, io, res);
+     // A console wave64 compute program on a host of 32-lane waves that
+     // still needs 64 lanes, or whose cross-lane code sits where not every
+@@ -786,6 +789,86 @@
+     }
+ }
+ 
++fn water_transmission_bounds(c: &Container, native: &NativeProgram) -> Option<usize> {
++    if lower::host_max_wave() != 32
++        || !native.wave64
++        || !matches!(native.io, crate::native::StageIo::Cs(cs) if cs.threads == [8, 8, 1])
++    {
++        return None;
++    }
++    let size = c.part(FourCC::DXIL)?.data.len();
++    let init = match (u128::from_be_bytes(c.digest), size) {
++        (0x24126c14_dc7619b0_82ef5712_96038890, 10156) => 0x230, // 5dc3b25986622949
++        (0x7099a57f_ded14261_3b44f410_463d6be6, 15728) => 0x244, // 6f225b641c5b0708
++        _ => return None,
++    };
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    (*ON.get_or_init(|| {
++        std::env::var_os("VICTORY_FOX_WATER_TRANSMISSION_WAVE32")
++            .is_some_and(|value| value == "1")
++    })).then_some(init)
++}
++
++/// A group is one guest wave. For a split host wave, preserve the guest's
++/// scalar branches and keep EXEC as a guard on individual vector operations.
++fn emit_water_transmission(
++    c: &Container,
++    native: &NativeProgram,
++    p: &ir::Program,
++    st: &structure::Structured,
++    init: usize,
++) -> Result<HostShader, ShaderError> {
++    if !p.blocks.iter().flat_map(|block| &block.insts).any(|inst| {
++        inst.machine.offset == init && inst.name() == "ds_write2_b32"
++    }) {
++        return Err(ShaderError::Unsupported {
++            offset: init,
++            what: "the original transmission bounds initializer was not retained",
++        });
++    }
++    let mut wide = st.wide.clone();
++    let add_mask_branches = |wide: &mut std::collections::HashSet<usize>, st: &structure::Structured| {
++        wide.extend(st.wave_any.iter().enumerate().filter_map(|(block, vote)| vote.map(|_| block)));
++    };
++    add_mask_branches(&mut wide, st);
++    loop {
++        let st = structure::structure_wide(p, &wide)?;
++        if wide.iter().any(|&b| st.wave_any[b].is_none()) {
++            return Err(ShaderError::Unsupported {
++                offset: 0,
++                what: "a water transmission branch lost its wave condition",
++            });
++        }
++        let count = wide.len();
++        add_mask_branches(&mut wide, &st);
++        if wide.len() != count {
++            continue;
++        }
++        if let Some(block) = st.exits.iter().enumerate().find_map(|(b, exit)| {
++            let structure::LaneExit::Branch { when, .. } = *exit else { return None };
++            let varying = st.bools.support(when).iter().any(|atom| {
++                !matches!(atom, structure::Atom::Uniform(_))
++            });
++            (!wide.contains(&b) && varying).then_some(b)
++        }) {
++            return Err(ShaderError::Unsupported {
++                offset: p.blocks[block].offset,
++                what: "a water transmission branch depends on an individual lane",
++            });
++        }
++        let io = io::raise(p, native)?;
++        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
++        let (shader, wave) = emit_program_with_bounds(c, native, p, &st, &io, &res, Some(init))?;
++        if wave != Some(32) {
++            return Err(ShaderError::Unsupported {
++                offset: 0,
++                what: "water transmission did not lower to physical wave32",
++            });
++        }
++        return Ok(shader);
++    }
++}
++
+ /// The translated program, and the wave size it requires of the host.
+ fn emit_program(
+     c: &Container,
+@@ -794,6 +877,18 @@
+     st: &structure::Structured,
+     io: &io::Io,
+     res: &resource::Resources,
++) -> Result<(HostShader, Option<u32>), ShaderError> {
++    emit_program_with_bounds(c, native, p, st, io, res, None)
++}
++
++fn emit_program_with_bounds(
++    c: &Container,
++    native: &NativeProgram,
++    p: &ir::Program,
++    st: &structure::Structured,
++    io: &io::Io,
++    res: &resource::Resources,
++    water_bounds_init: Option<usize>,
+ ) -> Result<(HostShader, Option<u32>), ShaderError> {
+     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
+         match c.part(fourcc) {
+@@ -858,7 +953,7 @@
+         }
+         _ => 0,
+     };
+-    let l = lower::lower(&lower::Parts {
++    let parts = lower::Parts {
+         native,
+         p,
+         st,
+@@ -868,7 +963,12 @@
+         outputs,
+         prims,
+         mesh_stride,
+-    })?;
++    };
++    let l = if let Some(init) = water_bounds_init {
++        lower::lower_water_transmission(&parts, init)?
++    } else {
++        lower::lower(&parts)?
++    };
+     let wave_size = l.wave_size;
+     let shader = HostShader {
+         stage: native.stage,
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -111,9 +111,21 @@
+ /// at once (`shader.rs` `USER_DISPATCH_THREADS_X`; after DexNom/VIctory
+ /// bc3cd4b0, which does so for two of the programs by their digests).
+ pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, ShaderError> {
++    lower_program(parts, counted, None)
++}
++
++pub(super) fn lower_water_transmission(parts: &Parts, init: usize) -> Result<Lowered, ShaderError> {
++    lower_program(parts, false, Some(init))
++}
++
++fn lower_program(
++    parts: &Parts,
++    counted: bool,
++    water_bounds_init: Option<usize>,
++) -> Result<Lowered, ShaderError> {
+     let mut bad = HashMap::new();
+     loop {
+-        match Lower::new(parts, &bad).run(counted) {
++        match Lower::new(parts, &bad, water_bounds_init).run(counted) {
+             Ok(l) => return Ok(l),
+             Err(Stop::Retry(v, why)) => {
+                 if bad.insert(v, why).is_some() {
+@@ -263,6 +275,7 @@
+     s: Shader,
+     x: &'a Parts<'a>,
+     bad: &'a HashMap<Value, Why>,
++    water_bounds_init: Option<usize>,
+     lane_fail: HashMap<Value, Why>,
+     vals: HashMap<Value, Val>,
+     floats: HashMap<Value, V>,
+@@ -1388,7 +1401,11 @@
+ }
+ 
+ impl<'a> Lower<'a> {
+-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
++    fn new(
++        x: &'a Parts<'a>,
++        bad: &'a HashMap<Value, Why>,
++        water_bounds_init: Option<usize>,
++    ) -> Self {
+         let p = x.p;
+         let mut phi_at = HashMap::new();
+         for (b, block) in p.blocks.iter().enumerate() {
+@@ -1629,6 +1646,7 @@
+             s,
+             x,
+             bad,
++            water_bounds_init,
+             lane_fail: HashMap::new(),
+             vals: HashMap::new(),
+             floats: HashMap::new(),
+@@ -2026,6 +2044,9 @@
+         let id = self.s.m.i32(ident);
+         let x = self.s.m.select(c, on, x, id);
+         self.s.flags |= flags::WAVE_OPS;
++        if self.water_bounds_init.is_some() && op == Op::AddF && prefix.is_none() {
++            return self.water_f32_sum(x);
++        }
+         if op == Op::AddH {
+             return match prefix {
+                 Some(_) => Err("a wave prefix of an operation other than a sum"),
+@@ -2146,6 +2167,36 @@
+             r
+         };
+         Ok(if float { self.as_int(r) } else { r })
++    }
++
++    /// Preserve the native FP32 reduction's DPP8 adds and row exchange, then
++    /// add the upper half's subtotal to the lower half's in native order.
++    fn water_f32_sum(&mut self, mut bits: V) -> Result<V, Why> {
++        if !self.exchange.as_ref().is_some_and(|exchange| !exchange.1)
++            || !self.all_lanes(self.cur_ir)
++        {
++            return Err("a water transmission sum without a whole group exchange");
++        }
++        let c = self.cur;
++        let lane = self.lane_index();
++        for (keep, flip) in [(31, 1), (30, 2), (28, 4), (31, 15), (16, 16)] {
++            let keep = self.s.m.i32(keep);
++            let flip = self.s.m.i32(flip);
++            let source = self.s.m.bin(c, Bin::And, lane, keep);
++            let source = self.s.m.bin(c, Bin::Xor, source, flip);
++            let peer = self.read_lane(bits, source);
++            let peer = self.as_float(peer);
++            let value = self.as_float(bits);
++            let sum = self.s.m.bin(c, Bin::Add, peer, value);
++            bits = self.as_int(sum);
++        }
++        let zero = self.s.m.i32(0);
++        let subtotal = self.read_lane(bits, zero);
++        let (low, high) = self.exchange_halves(c, subtotal);
++        let low = self.as_float(low);
++        let high = self.as_float(high);
++        let sum = self.s.m.bin(c, Bin::Add, high, low);
++        Ok(self.as_int(sum))
+     }
+ 
+     /// `WaveActiveSum` of 64-bit floats (`f64(lo, hi)` in active lanes, `+0.0` elsewhere),
+@@ -2366,6 +2417,9 @@
+                 self.s.m.new_block()
+             });
+         }
++        if self.water_bounds_init.is_some() {
++            self.block[order[0]] = Some(self.init_water_bounds());
++        }
+         // Loop headers count iterations (`LOOP_LIMIT`).
+         for &b in &order {
+             let header = p.blocks[b]
+@@ -2456,6 +2510,29 @@
+             user_data,
+             samplers: self.samplers,
+         })
++    }
++
++    /// The guest's lane-zero store can be skipped when it has no water. Seed
++    /// the unsigned max and min before any lane can leave the entry block.
++    fn init_water_bounds(&mut self) -> usize {
++        let entry = self.s.entry;
++        let write = self.s.m.new_block();
++        let body = self.s.m.new_block();
++        let flat = self.s.op(entry, "flattenedThreadIdInGroup.i32", Attr::ReadNone, self.s.t.i32, 96, &[]);
++        let zero = self.s.m.i32(0);
++        let one = self.s.m.i32(1);
++        let max = self.s.m.i32(u32::MAX);
++        let leader = self.s.m.cmp(entry, pred::EQ, flat, zero);
++        self.s.m.terminate(entry, Term::CondBr(leader, write, body));
++        let lds = self.s.lds();
++        let farthest = self.s.m.element(write, lds, zero);
++        let nearest = self.s.m.element(write, lds, one);
++        self.s.m.store(write, farthest, zero);
++        self.s.m.store(write, nearest, max);
++        self.s.m.terminate(write, Term::Br(body));
++        let rendezvous = self.s.m.i32(1 | 8);
++        self.s.op(body, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[rendezvous]);
++        body
+     }
+ 
+     fn exported_out(&self, b: usize) -> bool {
+@@ -5294,6 +5371,9 @@
+     fn inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
+         let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
+         let offset = inst.machine.offset;
++        if self.water_bounds_init == Some(offset) {
++            return Ok(());
++        }
+         let name = inst.name();
+         self.local_ok = name.starts_with("s_bcnt1_i32_")
+             || name.starts_with("s_ff1_i32_")

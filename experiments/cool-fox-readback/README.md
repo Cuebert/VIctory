@@ -27,3 +27,9 @@ At two marked presents in the later D25C diagnostic, sampled lighting HDR, base-
 ## Native application-pipeline library replay
 
 [`persist-app-library-warm.patch`](persist-app-library-warm.patch) adds an opt-in bounded replay command for a private native application-pipeline library. In one RTX 5090 adapter/profile configuration, a fresh 16-recipe run produced 16 native builds and zero loads, then serialized a 644,284-byte library. A separate process with the same configuration loaded all 16 recipes natively with zero rebuilds and left the library size unchanged. The command caps a batch at 40 recipes. This verifies persistence for that recipe set and configuration only; no full-title startup, FPS or visual comparison was performed.
+
+## Tiled water Wave32 translation experiment
+
+[`fox-water-transmission-wave32.patch`](fox-water-transmission-wave32.patch) adds an opt-in Wave32 translator path for two tiled water compute programs, gated by their selectors and expected program structure. It requires `VICTORY_FOX_WATER_TRANSMISSION_WAVE32=1`; the flag and source fingerprint select a distinct shader-cache key, and separate clean caches should be used for on/off runs. The wave-wide fallback follows Felix2180's [GPL-3.0-or-later upstream PR #823](https://github.com/fxceless/victory-fork/pull/823); this patch adapts the guarded path to the Fox translator.
+
+Offline validation matched both emitted programs to the initialized reference. In a separate RTX 5090 bridge trial, both compute programs bound on first use in the same frame, neither had subsequent drops, and all 53 RT builder pipelines were active. The paired view showed water ripples, glints and fuller clouds, while rectangular water and shoreline artifacts remained. The reference and live trial used distinct runtimes/configurations. No per-compute fence or internal 4K resolution proof was captured, so these observations do not establish causality or a visual fix.
