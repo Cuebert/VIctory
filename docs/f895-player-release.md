@@ -6,7 +6,7 @@ No game files, title executables, saves, private launcher helpers, caches or run
 
 ## What the F895 run showed
 
-- Ordinary gameplay progressed through boat control at about 11 native frames per second in the sampled view. Gamepad-state readback confirmed the S/L/W inputs during the control check. This is a scene-specific observation, not a general performance guarantee.
+- F895's normal route reached the boat sequence and a stationary bridge view. The title's meter recorded about 11 native frames per second in that view with the stock HUD. This was not a driving-input or boat-control test; it is a scene-specific observation, not a general performance guarantee.
 - Faces remained continuous in the sampled F895 opening and boat cuts. Large material blocks remained on sampled clothing, and the off-glint water remained mostly smooth. A bright, continuous sun glint was visible at the bridge.
 - In a separate upload-and-hash comparison, the measured work fell from 31.1 ms to 6.8 ms while the game remained near 10 frames per second. The measured subsystem cost improved; the game cadence did not.
 - The shadow-cascade and interior-mip options were enabled together during the F895 visual run, so their separate visual effects are not established. The optional title BVH builder remains off by default. A separate experimental run showed the `Follow the plane` objective, hull, blue water and bridge at frame 1680, then crashed at frame 1701 before controllable boat input. Correct ray-traced lighting and driving in that run remain unverified.
@@ -19,8 +19,13 @@ From the repository root, copy `victory.example.toml` to the ignored `victory.to
 
 ```powershell
 cargo build --locked --release -p victory
+$env:VICTORY_COMPOSITE_GRADE_EDGE = '1'
+$env:VICTORY_SHADOW_CASCADE_IR = '1'
+$env:VICTORY_INTERIOR_MIP_RESIDENCY = '1'
 target\release\victory.exe run "<your game executable path>" --execute --console series-x
 ```
+
+These are the three options used for the F895 visual visit: the composite grade edge, shadow-cascade IR and interior-mip residency. Stock water was used; leave water/reflection switches unset. Other optional renderer switches were left at their defaults. The shadow-cascade and mip options ran together, so their separate effects are not established.
 
 The default cache and persistent save-data directories are `%LOCALAPPDATA%\victory\cache` and `%LOCALAPPDATA%\victory\data`. Set `cache_dir` and `data_dir` in `victory.toml`, or use `VICTORY_CACHE_DIR` and `VICTORY_DATA_DIR`, to choose other per-user locations outside the repository.
 
