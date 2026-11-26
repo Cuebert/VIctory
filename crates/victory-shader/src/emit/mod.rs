@@ -88,6 +88,7 @@ mod diff_tests;
 mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
+mod alpha_prefilter;
 mod lower;
 mod own_bits;
 mod rect;
@@ -377,6 +378,19 @@ pub fn emit(
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
+    if alpha_prefilter::selected(c, native) {
+        let st = alpha_prefilter::keep_empty_waves(p, st)?;
+        let handoff = alpha_prefilter::lds_handoff(p, &st)?;
+        let (shader, wave) = emit_with_handoff(c, native, p, &st, io, res, Some(&handoff))?;
+        return if wave == Some(32) {
+            Ok(shader)
+        } else {
+            Err(ShaderError::Unsupported {
+                offset: 0x9b0,
+                what: "the alpha prefilter did not retain its group handoff at Wave32",
+            })
+        };
+    }
     let original = emit_program(c, native, p, st, io, res);
     // A console wave64 compute program on a host of 32-lane waves that
     // still needs 64 lanes, or whose cross-lane code sits where not every
@@ -674,6 +688,18 @@ fn emit_program(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
+    emit_with_handoff(c, native, p, st, io, res, None)
+}
+
+fn emit_with_handoff(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    handoff: Option<&[bool]>,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -740,7 +766,7 @@ fn emit_program(
         ]
         && c.part(FourCC::DXIL).is_some_and(|part| part.data.len() == 4808)
         && std::env::var_os("VICTORY_COMPOSITE_GRADE_EDGE").is_some_and(|value| value == "1");
-    let l = lower::lower_with_grade_edge(
+    let l = lower::lower_with_handoff(
         &lower::Parts {
             native,
             p,
@@ -753,6 +779,7 @@ fn emit_program(
             mesh_stride,
         },
         composite_grade_edge,
+        handoff,
     )?;
     let wave_size = l.wave_size;
     let shader = HostShader {

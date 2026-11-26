@@ -88,16 +88,17 @@ enum Stop {
 
 #[cfg(test)]
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
-    lower_with_grade_edge(parts, false)
+    lower_with_handoff(parts, false, None)
 }
 
-pub(crate) fn lower_with_grade_edge(
+pub(super) fn lower_with_handoff(
     parts: &Parts,
     composite_grade_edge: bool,
+    handoff: Option<&[bool]>,
 ) -> Result<Lowered, ShaderError> {
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad, composite_grade_edge).run() {
+        match Lower::new(parts, &bad, composite_grade_edge, handoff).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -1255,7 +1256,12 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, composite_grade_edge: bool) -> Self {
+    fn new(
+        x: &'a Parts<'a>,
+        bad: &'a HashMap<Value, Why>,
+        composite_grade_edge: bool,
+        handoff: Option<&[bool]>,
+    ) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1338,7 +1344,7 @@ impl<'a> Lower<'a> {
                                 !lds(inst) || all.get(b).copied().unwrap_or(false)
                             })
                         });
-                        let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok;
+                        let mut lds_ok = !(s.lds_dwords > 0 && group > 32) || ok || handoff.is_some();
                         if !lds_ok && let Some(meet) = lds_meetings(p, x.st, &all) {
                             lds_meet = Some((all.clone(), meet));
                             lds_ok = true;
@@ -1354,10 +1360,11 @@ impl<'a> Lower<'a> {
                         }
                         if lds_ok {
                             wave = 32;
-                            split_lds = s.lds_dwords > 0 && group > 32;
+                            split_lds = s.lds_dwords > 0 && group > 32 && handoff.is_none();
                             if crosses {
                                 // lanes 32..63 are the other host wave: masks, lane reads and lane
                                 // numbers go through two exchange dwords past the program's LDS
+                                let all = handoff.map_or(all, <[bool]>::to_vec);
                                 exchange = Some((s.lds_dwords, group <= 32, all));
                                 s.lds_dwords += 2 * group.div_ceil(64);
                             }
