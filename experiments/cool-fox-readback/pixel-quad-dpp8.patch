@@ -1,0 +1,73 @@
+From: Codex
+Subject: [PATCH] shader: opt in to pixel DPP8 reads within the same quad
+
+Derived from the pixel DPP8 portion of DexNom/VIctory 921d8d3b43b44f3a6ca4b44095edd3c4baf10a87
+under GPL-3.0-or-later. Keep Fox's existing row, swizzle, compute and mesh paths.
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -7786,8 +7786,16 @@
+             return Err("a DPP operand");
+         };
+         let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a DPP operand")?)?;
+-        // Quad permutations and DPP8 stay in groups the pixel layout shares.
+-        let quad = matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
++        static PIXEL_QUAD_DPP8: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        // A DPP8 encoding contains two quads. A pixel shader can only
++        // translate the operation if every destination reads its own quad.
++        let pixel_dpp8 = self.s.pixel
++            && matches!(dpp, Dpp::Lanes { sel, .. }
++                if (0..8).all(|i| ((sel >> (3 * i)) ^ i) & 4 == 0))
++            && *PIXEL_QUAD_DPP8.get_or_init(|| {
++                std::env::var_os("VICTORY_PIXEL_QUAD_DPP8").is_some_and(|value| value == "1")
++            });
++        let quad = pixel_dpp8 || matches!(dpp, Dpp::Row { ctrl: 0..=0xFF, .. });
+         let mesh_quad = self.s.mesh.is_some() && quad;
+         if !mesh_quad {
+             self.cross_lane(quad)?;
+@@ -7867,7 +7875,9 @@
+                 (src, inside, masks, bound_ctrl)
+             }
+         };
+-        let mut r = if mesh_quad {
++        let mut r = if mesh_quad || pixel_dpp8 {
++            // DexNom 921d8d3b: a native quad read can read an adjacent
++            // helper lane, unlike a wave lane read in a pixel shader.
+             self.quad_pick(x, src)
+         } else if let Dpp::Row { ctrl, .. } = dpp
+             && self.helpers_read(quad)
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -2726,6 +2726,31 @@
+         let _ = shader;
+     }
+ 
++    #[test]
++    fn quad_local_pixel_dpp8_requires_the_opt_in() {
++        let [e0, e1] = exp_mrt0(3);
++        let translate_dpp8 = |select: u32| {
++            let words = [
++                0xc808_0000, 0xc809_0001, // interpolate attr0.x into v2
++                0x7e06_02e9, (select << 8) | 2, // v_mov_b32 v3, v2 with DPP8
++                e0, e1, 0xbf81_0000,
++            ];
++            pixel(&words, PERSP_CENTER)
++        };
++        let legitimate = [3u32, 0, 2, 1, 4, 6, 5, 7]
++            .into_iter()
++            .enumerate()
++            .fold(0, |select, (lane, source)| select | source << (3 * lane));
++        let stock = translate_dpp8(legitimate);
++        if std::env::var_os("VICTORY_PIXEL_QUAD_DPP8").is_some_and(|value| value == "1") {
++            validate(&stock.unwrap());
++        } else {
++            assert!(stock.is_err());
++        }
++        assert!(translate_dpp8(legitimate ^ 4).is_err()); // lane 0 reads lane 7
++        assert!(translate_dpp8(legitimate ^ (4 << 21)).is_err()); // lane 7 reads lane 3
++    }
++
+     /// Custom interpolation reads I and J (v0, v1 with PERSP_CENTER) as
+     /// plain floats: they are channels y and z of `SV_Barycentrics`, the
+     /// weights of vertices 1 and 2.

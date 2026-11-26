@@ -19,3 +19,7 @@ These arms executed unequal work, so this is not an isolated RT-cost or render-p
 ## D25C scene-buffer diagnostic
 
 At two marked presents in the later D25C diagnostic, sampled lighting HDR, base-color and resolved-depth resources were 2560×1440, while the final output was 3840×2160. This establishes those dimensions for those D25C samples only. Earlier D508 timing rows verify output modes, not internal scene-buffer dimensions. The source distinguishes the display mode reported to the title from a measured render-target size ([`display_size`](https://github.com/Cuebert/VIctory/blob/f4b48ad766ddbec1a1867022cd42f7645b0dd55e/crates/victory-gpu/src/dxgi.rs#L232-L237)).
+
+## Pixel DPP8 translation experiment
+
+[`pixel-quad-dpp8.patch`](pixel-quad-dpp8.patch) adds an opt-in translator path for pixel-shader DPP8 permutations whose eight selectors each stay within their own four-lane quad. Enable it with `VICTORY_PIXEL_QUAD_DPP8=1`; the default path remains unchanged, as do row, swizzle, compute and mesh handling. This change is derived from the pixel DPP8 portion of DexNom's [GPL-3.0-or-later commit `921d8d3`](https://github.com/DexNom/VIctory/commit/921d8d3b43b44f3a6ca4b44095edd3c4baf10a87). A focused translation fixture passed with the opt-in both disabled and enabled, while selectors crossing quad boundaries remained rejected. This is a source-level translator experiment; it has no full-title, performance or visual-result claim.
