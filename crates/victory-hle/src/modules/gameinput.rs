@@ -21,9 +21,6 @@ use super::xasync::{E_INVALIDARG, E_NOTIMPL};
 use super::xgameruntime::{HRESULT, S_OK};
 use crate::{HleExport, HleModule};
 
-#[cfg(all(windows, feature = "diagnostics"))]
-mod live_input;
-
 /// The documented errors.
 pub const DEVICE_DISCONNECTED: HRESULT = 0x838A_0001_u32 as i32;
 pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
@@ -61,7 +58,7 @@ const KEYBOARD: usize = PADS + 1;
 const DEVICES: usize = PADS + 2;
 
 /// Readings kept per device for next/previous lookups.
-const HISTORY: usize = 32;
+const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
@@ -114,12 +111,6 @@ trait Source: Send {
     fn pad(&mut self, slot: usize) -> Option<PadState>;
     /// Keys held down; none while the title's window lacks focus.
     fn keys(&mut self) -> Vec<KeyState>;
-    /// The private command's keys held now (the second is a compound
-    /// command's delayed key), and the phase a reading showing them may carry.
-    #[cfg(all(windows, feature = "diagnostics"))]
-    fn live_keys(&mut self) -> ([Option<KeyState>; 2], Option<std::sync::Arc<live_input::Phase>>) {
-        ([None; 2], None)
-    }
     /// Motor speeds: low frequency (left), high frequency (right).
     fn rumble(&mut self, slot: usize, low: u16, high: u16);
 }
@@ -242,8 +233,6 @@ pub struct Reading {
     sequence: u64,
     timestamp: u64,
     value: Value,
-    #[cfg(all(windows, feature = "diagnostics"))]
-    private_phase: std::sync::OnceLock<std::sync::Arc<live_input::Phase>>,
 }
 
 impl Reading {
@@ -412,44 +401,12 @@ impl Hub {
 
     /// Reads the host once; device callbacks run on the calling thread.
     fn poll(&self) {
-        #[cfg(all(windows, feature = "diagnostics"))]
-        let phase;
         let (pads, keys) = {
             let mut source = lock(&self.source);
             let pads: [_; PADS] = std::array::from_fn(|slot| source.pad(slot));
-            let sample = (pads, source.keys());
-            #[cfg(all(windows, feature = "diagnostics"))]
-            let sample = {
-                let (keys, observed) = source.live_keys();
-                phase = observed;
-                live_input::merge(sample, keys)
-            };
-            sample
+            (pads, source.keys())
         };
-        let mut state = self.state();
-        #[cfg(all(windows, feature = "diagnostics"))]
-        let tagged = phase.map(|phase| {
-            let pad = pads.iter().position(Option::is_some).unwrap_or(FALLBACK);
-            let prior = [pad, KEYBOARD].map(|i| {
-                let slot = &state.slots[i];
-                (i, slot.connected.then_some(slot.sequence))
-            });
-            (phase, prior)
-        });
-        let events = state.poll(&self.devices, pads, keys);
-        #[cfg(all(windows, feature = "diagnostics"))]
-        if let Some((phase, devices)) = tagged {
-            for (device, prior) in devices {
-                let mut history = state.slots[device].history.iter().rev();
-                if let (Some(new), Some(old)) = (history.next(), history.next())
-                    && Some(old.sequence) == prior
-                    && phase.follows(old, new)
-                {
-                    let _ = new.private_phase.set(std::sync::Arc::clone(&phase));
-                }
-            }
-        }
-        drop(state);
+        let events = self.state().poll(&self.devices, pads, keys);
         self.deliver(events);
     }
 
@@ -534,8 +491,6 @@ impl State {
                 sequence: slot.sequence,
                 timestamp: now,
                 value,
-                #[cfg(all(windows, feature = "diagnostics"))]
-                private_phase: Default::default(),
             }));
         }
         if was != slot.connected {
@@ -682,7 +637,7 @@ fn relative(
     // SAFETY: a reading we handed out and the title still holds.
     let reference = unsafe { &*reference };
     // shortcut: with no device given only the reference's device is walked,
-    // not every device's readings in time order; Grand Theft Auto VI walks
+    // not every device's readings in time order; the title walks
     // only keyboard readings (one device) and the current pad's previous one.
     let Some(index) = hub.index(reference.device) else {
         return fail(out, E_INVALIDARG);
@@ -757,7 +712,7 @@ fn token(out: *mut u64) -> HRESULT {
     S_OK
 }
 
-// shortcut: reading callbacks never run; Grand Theft Auto VI registers none
+// shortcut: reading callbacks never run; the title registers none
 // (it polls).
 extern "system" fn register_reading(
     _: This,
@@ -863,10 +818,7 @@ extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> 
             return true;
         }
         state = match deadline {
-            None => hub
-                .returned
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner),
+            None => hub.returned.wait(state).unwrap_or_else(PoisonError::into_inner),
             Some(deadline) => {
                 let Some(left) = deadline.checked_duration_since(Instant::now()) else {
                     return false;
@@ -959,7 +911,7 @@ extern "system" fn device_status(this: *const Device) -> u32 {
 // shortcut: trigger motors are dropped (XInput has none). The host API that
 // drives them without a redistributable is Windows.Gaming.Input (WinRT
 // `Gamepad.Vibration`), which needs WinRT bindings this crate lacks outside
-// diagnostics builds; Grand Theft Auto VI sends trigger levels in slot 0x50.
+// diagnostics builds; the title sends trigger levels in slot 0x50.
 extern "system" fn set_rumble(this: *const Device, params: *const [f32; 4]) {
     // SAFETY: one of our devices.
     let device = unsafe { &*this };
@@ -1044,15 +996,7 @@ extern "system" fn reading_device(this: *const Reading, out: *mut *const Device)
 }
 extern "system" fn key_count(this: *const Reading) -> u32 {
     match &reading(this).value {
-        Value::Keys(keys) => {
-            #[cfg(all(windows, feature = "diagnostics"))]
-            if keys.is_empty()
-                && let Some(phase) = reading(this).private_phase.get()
-            {
-                phase.keys_returned("GetKeyCount", reading(this).sequence, keys, 0);
-            }
-            keys.len() as u32
-        }
+        Value::Keys(keys) => keys.len() as u32,
         Value::Pad(_) => 0,
     }
 }
@@ -1066,10 +1010,6 @@ extern "system" fn key_state(this: *const Reading, count: u32, out: *mut KeyStat
     let n = keys.len().min(count as usize);
     // SAFETY: the title passes room for `count` keys.
     unsafe { std::ptr::copy_nonoverlapping(keys.as_ptr(), out, n) };
-    #[cfg(all(windows, feature = "diagnostics"))]
-    if let Some(phase) = reading(this).private_phase.get() {
-        phase.keys_returned("GetKeyState", reading(this).sequence, keys, n);
-    }
     n as u32
 }
 extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bool {
@@ -1077,10 +1017,6 @@ extern "system" fn gamepad_state(this: *const Reading, out: *mut PadState) -> bo
         Value::Pad(state) if !out.is_null() => {
             // SAFETY: checked non-null.
             unsafe { out.write(*state) };
-            #[cfg(all(windows, feature = "diagnostics"))]
-            if let Some(phase) = reading(this).private_phase.get() {
-                phase.pad_returned(reading(this).sequence);
-            }
             true
         }
         _ => false,
@@ -1194,8 +1130,6 @@ mod host {
     #[derive(Default)]
     pub(super) struct Host {
         empty_until: [Option<Instant>; PADS],
-        #[cfg(feature = "diagnostics")]
-        live: live_input::Channel,
     }
 
     impl Source for Host {
@@ -1215,7 +1149,7 @@ mod host {
             // The scripted keys (`VICTORY_KEYS`) also press the first
             // pad's buttons, by the stand-in pad's table: with a real pad
             // connected the stand-in is not there, and a title that listens
-            // to the pad (Grand Theft Auto VI's start screen) saw nothing.
+            // to the pad (the title's start screen) saw nothing.
             #[cfg(feature = "diagnostics")]
             if slot == 0 {
                 for vk in scripted() {
@@ -1242,14 +1176,16 @@ mod host {
                     .collect();
                 down.extend(held);
             }
-            down.into_iter().map(key_state).collect()
-        }
-
-        #[cfg(feature = "diagnostics")]
-        fn live_keys(&mut self) -> ([Option<KeyState>; 2], Option<std::sync::Arc<live_input::Phase>>) {
-            let first = self.live.held(Instant::now());
-            let keys = [first, self.live.second].map(|key| key.map(key_state));
-            (keys, self.live.phase.clone())
+            down.into_iter()
+                .map(|vk| KeyState {
+                    // SAFETY: plain query.
+                    scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
+                    virtual_key: vk,
+                    // shortcut: no characters (code point 0);
+                    // the title reads scan codes and virtual keys only.
+                    ..Default::default()
+                })
+                .collect()
         }
 
         fn rumble(&mut self, slot: usize, low: u16, high: u16) {
@@ -1259,15 +1195,6 @@ mod host {
             };
             // SAFETY: a valid vibration; an empty slot just fails.
             unsafe { XInputSetState(slot as u32, &speeds) };
-        }
-    }
-
-    fn key_state(vk: u8) -> KeyState {
-        KeyState {
-            // SAFETY: plain query. The title reads scan codes and virtual keys.
-            scan_code: unsafe { MapVirtualKeyW(u32::from(vk), MAPVK_VK_TO_VSC_EX) },
-            virtual_key: vk,
-            ..Default::default()
         }
     }
 
@@ -1651,16 +1578,7 @@ mod tests {
         let mut token = 0;
         let context = (&raw const hub.object).cast_mut().cast();
         assert_eq!(
-            register(
-                &hub.object,
-                std::ptr::null(),
-                GAMEPAD_KIND,
-                1,
-                0,
-                context,
-                Some(slow),
-                &mut token
-            ),
+            register(&hub.object, std::ptr::null(), GAMEPAD_KIND, 1, 0, context, Some(slow), &mut token),
             S_OK
         );
         host.lock().unwrap().pads[1] = Some(PadState::default());
@@ -1669,10 +1587,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         let unregister = slot::<extern "system" fn(This, u64, u64) -> bool, _>(&hub.object, 0x68);
-        assert!(
-            !unregister(&hub.object, token, 5000),
-            "times out while it runs"
-        );
+        assert!(!unregister(&hub.object, token, 5000), "times out while it runs");
         let leave = std::thread::spawn(|| {
             std::thread::sleep(Duration::from_millis(50));
             LEAVE.store(true, Ordering::SeqCst);

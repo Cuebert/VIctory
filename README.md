@@ -1,5 +1,9 @@
 # VIctory on Windows — sunlit prologue and Gone Fishing
 
+## F895 player source snapshot (26 November 2026)
+
+This branch carries the source tree used for the F895 player run, based on the publicly attributed [fxceless/victory-fork commit `bc6ee68`](https://github.com/fxceless/victory-fork/commit/bc6ee68ea17030fa9531837e395404cfd1856656). It contains source and build inputs only: no game files, title binaries, saves, private launcher, caches or run traces. See [the portable build guide and verified scope](docs/f895-player-release.md). The status below is an earlier run; the F895 measurements are in the linked release note.
+
 On 24 November 2026, cuebert independently reproduced a sunlit prison yard on Windows 11 with a GeForce RTX 5090. Walking to the guard advanced the mission. The player followed the guard, interacted at the teller counter, reached a vehicle inspection and entered Gone Fishing. The water and bridge were visible in the ordinary game window. The mission later reported that Cal had fallen overboard. Driving, boat control and completion of Gone Fishing remain unverified. [Original game-window screenshot](https://github.com/Cuebert/gta6-progress/blob/9fadc1cb03fa4887519909bf047d9c661d220f6e/images/gone-fishing-water-and-bridge.png) · [English journal](https://cuebert.github.io/gta6-progress/en/evidence.html#sunlit-world) · [中文日志](https://cuebert.github.io/gta6-progress/evidence.html#sunlit-world)
 
 The underlying VIctory engine is the work of Marvisak and the VIctory contributors. The sunlit world already rendered on the fxceless fork. Our original run added guarded file access, input support and GPU checks to that baseline. The changes and measurements below followed on separate builds. [VIctory](https://github.com/Marvisak/VIctory) · [Exact fxceless baseline](https://github.com/fxceless/victory-fork/commit/16849898f3282c4a7189b1557289c194bc720052)

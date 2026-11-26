@@ -4,7 +4,7 @@
 //! types.
 //!
 //! Host pipelines are made on a pipeline's first draw, not at creation:
-//! Grand Theft Auto VI creates some 60,000 pipelines in its first 20
+//! The title creates some 60,000 pipelines in its first 20
 //! seconds and draws with a few dozen (decision 0007, step 3). Shader
 //! containers are shared by content hash and translated once, on first
 //! use (decision 0003).
@@ -63,6 +63,10 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    /// Whether its code walks the ray-tracing structures, once looked at
+    /// ([`Shader::walks`]).
+    #[cfg(windows)]
+    walks: OnceLock<bool>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -113,6 +117,8 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                walks: OnceLock::new(),
             })
         })
         .clone()
@@ -263,6 +269,87 @@ pub(crate) fn builder_quarantined(this: This) -> bool {
     is_builder(this) && *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_QUARANTINE").is_some_and(|v| v == "1"))
 }
 
+#[cfg(windows)]
+impl Shader {
+    /// Whether the program walks the ray-tracing structures: its code has
+    /// an `image_bvh_intersect_ray` or `image_bvh64_intersect_ray`. Looked
+    /// at once, when a dispatch first asks.
+    fn walks(&self) -> bool {
+        *self.walks.get_or_init(|| container_walks(&self.container))
+    }
+}
+
+/// Whether a console container's code tests rays against the nodes of a
+/// ray-tracing structure.
+#[cfg(windows)]
+fn container_walks(container: &[u8]) -> bool {
+    use victory_shader::{Container, FourCC};
+    let Ok(c) = Container::parse(container) else {
+        return false;
+    };
+    c.part(FourCC::DXIL)
+        .and_then(|part| victory_shader::native_programs(part.data).ok())
+        .is_some_and(|programs| programs.iter().any(|p| code_walks(&p.code)))
+}
+
+/// Whether native code has a ray-tracing node test.
+#[cfg(windows)]
+fn code_walks(code: &[u8]) -> bool {
+    victory_shader::gfx10::decode(code).is_ok_and(|code| code.iter().any(|i| i.name().is_some_and(|n| n.starts_with("image_bvh"))))
+}
+
+/// Dispatches held back by [`walk_held`] since the last frame line.
+#[cfg(windows)]
+pub(crate) static WALKS_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a dispatch with the title's pipeline `this` is held back
+/// because its program walks ray-tracing structures nothing has built
+/// (`VICTORY_BVH_HOLD=1`; off by default).
+///
+/// The structure builder does not run (see [`Builder`]: only with
+/// `VICTORY_BVH_BUILDER=1`, and then only whole, which a host of 32-lane
+/// waves does not manage yet). The title's ray-traced passes run all the
+/// same: 64 programs of its shader pack test rays against structure nodes
+/// (ray-traced shadows, screen probes, reflections, the irradiance cache;
+/// one of them, `CS_IrradianceCache_ShadowTrace_WithFar` f607780aa8e502d0,
+/// from the first world frame on in every run). Each walks, in a loop the
+/// title bounds at 65,535 steps a wave, whatever bytes lie where the
+/// structure would be: what it returns is not a picture of the scene, and
+/// how long it runs depends on those bytes. Upstream's pull request 2311
+/// measured a card hung in exactly that dispatch on an NVIDIA card, every
+/// run, and both card losses of ours since the draw windows' own fault was
+/// fixed (runs 208 and 224) came within a second of the first use of the
+/// programs that shade those rays' hits (`CS_RaytracingResolve`).
+///
+/// With the switch such a dispatch is dropped until the builder has run
+/// whole. What the passes would have written stays as the title left it
+/// (their targets are not cleared by us): the picture has to be looked at.
+#[cfg(windows)]
+pub(crate) fn walk_held(this: This) -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    if this.is_null() || !*ON.get_or_init(|| std::env::var_os("VICTORY_BVH_HOLD").is_some_and(|v| v == "1")) {
+        return false;
+    }
+    let p = pipeline(this);
+    if !p.shaders.iter().any(|s| s.stage == "compute" && s.walks()) {
+        return false;
+    }
+    // (Asked only for the few programs that walk: the lock is the builder's.)
+    if BUILDER.lock().unwrap_or_else(|e| e.into_inner()).whole {
+        return false;
+    }
+    if WALKS_HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            tracing::info!(
+                shaders = ?p.shaders,
+                "a dispatch of a program that walks ray-tracing structures is held back: the structure builder has not                  built them (VICTORY_BVH_HOLD=1); the first one"
+            );
+        });
+    }
+    true
+}
+
 /// Whether the title's pipeline `this` is one of the structure builder's.
 #[cfg(windows)]
 pub(crate) fn is_builder(this: This) -> bool {
@@ -392,6 +479,24 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
         return None;
     }
     make::ready(&pipeline(this).host)
+}
+
+/// As [`host_pipeline`], for a draw into render target and depth views of
+/// the formats `bound`: if a bound view has another format than the title's
+/// pipeline declares for its slot (`host::formats_differ`), the host
+/// pipeline of the same shaders and state made for the bound formats
+/// (`make::for_formats`). A draw whose views are as declared pays one
+/// comparison of the nine words.
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    let p = &pipeline(this).host;
+    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
+        return make::for_formats(p, bound);
+    }
+    make::ready(p)
 }
 
 /// Host pipelines queued and not made yet.
@@ -662,6 +767,17 @@ pub(crate) extern "system" fn create_stream(
         };
         at += size;
     }
+    // The whole state is read: integer targets do not blend on the host
+    // (`GraphicsState::integer_targets_do_not_blend`).
+    #[cfg(windows)]
+    if graphics.integer_targets_do_not_blend() {
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::info!(
+                "a pipeline of the title's blends into a render target of integers: blending is off for that target on the host (said once)"
+            );
+        });
+    }
     hand_out(
         shaders,
         #[cfg(windows)]
@@ -692,6 +808,14 @@ static FUNCTIONS: Table<24> = {
 pub(crate) mod host;
 #[cfg(windows)]
 mod library;
+
+/// Host pipelines created and loaded from the library since the start
+/// (`crate::framelog`).
+#[cfg(windows)]
+pub(crate) fn frame_log_counts() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (library::MADE.load(Relaxed), library::LOADED.load(Relaxed))
+}
 #[cfg(windows)]
 mod make;
 
@@ -724,6 +848,84 @@ pub fn save_pipeline_cache() {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    fn peer_fixture_gpu() -> &'static crate::host::Host {
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4,
+        };
+
+        let gpu = crate::host::host().expect("host D3D12 device");
+        // SAFETY: these queries use the real device and an initialized DXGI factory.
+        let adapter = unsafe {
+            let factory: IDXGIFactory4 = CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)).unwrap();
+            let luid = gpu.device.GetAdapterLuid();
+            println!("adapter LUID {}:{}", luid.LowPart, luid.HighPart);
+            factory.EnumAdapterByLuid::<IDXGIAdapter1>(luid).unwrap().GetDesc1().unwrap()
+        };
+        let adapter_name = String::from_utf16_lossy(&adapter.Description);
+        assert_eq!(adapter.VendorId, 0x10de);
+        assert_eq!(adapter.Flags & 2, 0, "software adapter");
+        assert!(adapter_name.contains("RTX 5090"), "adapter {adapter_name}");
+        println!("physical adapter {}", adapter_name.trim_end_matches('\0'));
+        gpu
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires the three original shader containers and a physical RTX 5090"]
+    fn peer_water_reflection_compute_pipelines() {
+        use victory_shader::emit::validator::Validator;
+
+        let inputs = std::env::var_os("VICTORY_PEER_PSO_INPUTS").expect("shader input paths");
+        let inputs: Vec<_> = std::env::split_paths(&inputs).collect();
+        assert_eq!(inputs.len(), 3);
+        let enabled = std::env::var_os("VICTORY_WATER_REFLECTION_WAVE32").is_some_and(|v| v == "1");
+        let gpu = peer_fixture_gpu();
+
+        let dll = Validator::default_path().expect("Windows SDK DXIL validator");
+        let mut validator = Validator::load(Some(&dll)).unwrap();
+        for (path, hash) in inputs.iter().zip(["2cc4c197ee29e291", "5dc3b25986622949", "6f225b641c5b0708"]) {
+            let bytes = std::fs::read(path).unwrap();
+            let compute = shader("compute", &bytes);
+            assert_eq!(compute.hash, hash);
+            let shader = compute.translated().expect("original program translated");
+            validator.validate(&mut shader.host.dxil.clone()).unwrap();
+            let pso = host::HostPipeline::new(&[compute], None);
+            println!("{hash}: SDK validated, host compute PSO created={}", pso.is_some());
+            assert_eq!(pso.is_some(), enabled, "{hash}");
+        }
+        // SAFETY: this queries the device status after PSO creation without submitting work.
+        unsafe { gpu.device.GetDeviceRemovedReason() }.unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires the original cascade shader and a physical RTX 5090"]
+    fn peer_alpha_shadow_compute_pipeline() {
+        use victory_shader::emit::validator::Validator;
+
+        let input = std::env::var_os("VICTORY_PEER_ALPHA_SHADOW").expect("alpha cascade input");
+        let bytes = std::fs::read(input).unwrap();
+        let compute = shader("compute", &bytes);
+        assert_eq!(compute.hash, "f133e35efed2a48a");
+        let enabled = std::env::var_os("VICTORY_SHADOW_CASCADE_IR").is_some_and(|v| v == "1");
+        let gpu = peer_fixture_gpu();
+        if enabled {
+            let dxil = &compute.translated().expect("alpha cascades translated").host.dxil;
+            let dll = Validator::default_path().expect("Windows SDK DXIL validator");
+            Validator::load(Some(&dll)).unwrap().validate(&mut dxil.clone()).unwrap();
+            assert!(host::HostPipeline::new(std::slice::from_ref(&compute), None).is_some());
+            println!("f133e35efed2a48a: SDK validated, host compute PSO created ({})", dxil.len());
+        } else {
+            let error = translate(&bytes).err().expect("stock translation fails");
+            assert!(error.contains("0x1eb4"), "{error}");
+            assert!(error.contains("a lane mask exchanged where not every lane runs"), "{error}");
+            println!("f133e35efed2a48a: stock translation failed: {error}");
+        }
+        // SAFETY: this queries the device status without submitting work.
+        unsafe { gpu.device.GetDeviceRemovedReason() }.unwrap();
+    }
+
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn skip_hashes_accepts_full_hashes_only() {
@@ -787,7 +989,7 @@ mod tests {
         assert_eq!(slot::<extern "system" fn(This) -> u32>(p, 0x10)(p), 0);
     }
 
-    /// The stream layout Grand Theft Auto VI builds (title+0x86f090): root
+    /// The stream layout the title builds (title+0x86f090): root
     /// signature, five shader slots (the first a mesh shader), blend, sample
     /// mask, rasterizer, depth-stencil 1, sample description, input layout,
     /// topology, render target and depth formats: 0x2b0 bytes.

@@ -31,11 +31,11 @@ pub(crate) fn listed(n: u64) -> bool {
     // `VICTORY_CAPTURE_WORLD`: also the 2nd and the 6th frame after the first
     // one that ran 500 draws or more (a title's first 3D frames: their
     // numbers depend on how long the menus were shown), and the 30th and
-    // the 80th (Grand Theft Auto VI opens with a cutscene made in the
+    // the 80th (the title opens with a cutscene made in the
     // engine: later shots of it, in case the first is dark by design).
     //
     // `VICTORY_CAPTURE_WORLD_ALSO` (comma-separated): more frames counted
-    // from that first one (Grand Theft Auto VI's blue patches show from
+    // from that first one (the title's blue patches show from
     // about the 118th frame on, when the window's model has arrived and
     // the reflections hold values: none of the four above has them).
     static ALSO: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
@@ -58,12 +58,24 @@ pub(crate) fn listed(n: u64) -> bool {
 /// stays empty.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn op(list: usize, what: impl FnOnce() -> String) {
+    // A frame shot (`crate::shot`) keeps every line of its frame.
+    if crate::shot::keeping_lines() {
+        let text = what();
+        crate::shot::line(list, &text);
+        return op_listed(list, move || text);
+    }
+    op_listed(list, what);
+}
+
+/// [`op`] for the frames [`listed`] and the lines before the world.
+#[cfg(feature = "diagnostics")]
+fn op_listed(list: usize, what: impl FnOnce() -> String) {
     use std::io::Write;
     let frame = crate::queue::presented() + 1;
     if !listed(frame) {
         // Before the world: the last lines are kept, and written out when
         // it starts (`before-world-ops.txt`): what the title drew just
-        // before (Grand Theft Auto VI shows a title card there, whose text
+        // before (the title shows a title card there, whose text
         // did not show).
         if world_on() && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX {
             // At most 300 lines of a frame: the world's first frame alone
@@ -120,14 +132,28 @@ fn world_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_WORLD").is_some())
 }
 
+/// Every how many world frames a picture is saved with
+/// `VICTORY_CAPTURE_WORLD` (`VICTORY_CAPTURE_WORLD_EVERY`, 8 unless said).
+///
+/// A saved frame is read back at once and written as a PNG inside the
+/// present: run 225's frame log has every saved frame of the cell at 371 ms
+/// against a usual 136 (the present's own copy and show 137 ms instead of
+/// 2, and 123 ms more waiting for the card). At every 8th frame that was
+/// the regular dip of every test run, and a fifth of its time. A run that
+/// measures speed asks for 64 or more.
+fn world_every() -> u64 {
+    static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *EVERY.get_or_init(|| {
+        std::env::var("VICTORY_CAPTURE_WORLD_EVERY").ok().and_then(|v| v.trim().parse().ok()).filter(|&n| n > 0).unwrap_or(8)
+    })
+}
+
 /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// At the present of `frame`: the draws run on the host so far.
 pub(crate) fn frame_drew(frame: u64, drawn: u64) {
     use std::sync::atomic::Ordering::Relaxed;
-    #[cfg(feature = "diagnostics")]
-    crate::host::poll_fetch_mode();
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
     if world_on()
@@ -153,7 +179,7 @@ pub(crate) fn wanted(n: u64) -> bool {
     // cutscene (its shots do not fall on the same frame numbers from run to
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
-    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
+    let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(world_every());
     folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
 }
 
@@ -186,17 +212,34 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     header.extend(h.to_be_bytes());
     header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
     chunk(&mut png, b"IHDR", &header);
-    chunk(
-        &mut png,
-        b"IDAT",
-        &miniz_oxide::deflate::compress_to_vec_zlib(&raw, 3),
-    );
+    let mut compressed = vec![0u8; zlib_rs::compress_bound(raw.len())];
+    let (idat, rc) = zlib_rs::compress_slice(&mut compressed, &raw, zlib_rs::DeflateConfig::new(3));
+    debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
+    chunk(&mut png, b"IDAT", idat);
     chunk(&mut png, b"IEND", &[]);
     let path = folder.join(format!("{name}.png"));
     match std::fs::write(&path, png) {
         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
         Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
     }
+}
+
+/// A PNG of `w` by `h` 8-bit RGB pixels; `raw` is its rows, each after a
+/// filter byte 0 (for `crate::shot`, whose pictures have names and sizes
+/// of their own).
+pub(crate) fn png_rgb(w: u32, h: u32, raw: &[u8]) -> Vec<u8> {
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    let mut header = Vec::new();
+    header.extend(w.to_be_bytes());
+    header.extend(h.to_be_bytes());
+    header.extend([8, 2, 0, 0, 0]); // 8-bit RGB
+    chunk(&mut png, b"IHDR", &header);
+    let mut compressed = vec![0u8; zlib_rs::compress_bound(raw.len())];
+    let (idat, rc) = zlib_rs::compress_slice(&mut compressed, raw, zlib_rs::DeflateConfig::new(3));
+    debug_assert_eq!(rc, zlib_rs::ReturnCode::Ok);
+    chunk(&mut png, b"IDAT", idat);
+    chunk(&mut png, b"IEND", &[]);
+    png
 }
 
 fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
@@ -231,7 +274,7 @@ pub(crate) fn read_back(
 
 /// As [`read_back`], of subresource `sub` (the stencil plane of a
 /// one-level, one-slice depth-stencil texture is subresource 1).
-fn read_back_of(
+pub(crate) fn read_back_of(
     device: &ID3D12Device,
     list: &ID3D12GraphicsCommandList,
     texture: &ID3D12Resource,
@@ -303,81 +346,7 @@ fn read_back_of(
     }
 }
 
-/// The copy has completed on the GPU. Move ownership of its dedicated
-/// readback resource to the encoder; the swap-chain buffers stay on the
-/// presenter. Keep at most two queued images and one in progress.
-pub(crate) fn finish_frame(
-    frame: u64,
-    buffer: ID3D12Resource,
-    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
-) {
-    type Frame = (u64, ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT);
-    static ENCODER: std::sync::OnceLock<Option<std::sync::mpsc::SyncSender<Frame>>> = std::sync::OnceLock::new();
-    let sender = ENCODER.get_or_init(|| {
-        if std::env::var_os("VICTORY_CAPTURE_SYNC").is_some() {
-            return None;
-        }
-        let (send, recv) = std::sync::mpsc::sync_channel::<Frame>(2);
-        std::thread::Builder::new().name("presented-frame-png".into()).spawn(move || {
-            for (frame, buffer, footprint) in recv {
-                save_read_back(frame, &buffer, &footprint);
-            }
-        }).ok().map(|_| send)
-    });
-    let work = (frame, buffer, footprint);
-    let (frame, buffer, footprint) = match sender {
-        Some(sender) => match sender.send(work) {
-            Ok(()) => return,
-            Err(error) => error.0,
-        },
-        None => work,
-    };
-    save_read_back(frame, &buffer, &footprint);
-}
-
 /// Saves a frame read back by [`read_back`] (8-bit color only).
-#[cfg(test)]
-#[test]
-#[ignore = "requires a Windows D3D12 adapter and a private VICTORY_CAPTURE folder"]
-fn async_present_capture_preserves_gpu_pixels_and_row_pitch() {
-    let host = crate::host::host().expect("D3D12 host required");
-    let folder = folder().expect("private fixture folder required");
-    let (width, height, pitch) = (8, 4, 256);
-    let mut source = vec![0x66u8; pitch * height];
-    for y in 0..height {
-        for x in 0..width {
-            let offset = y * pitch + x * 4;
-            source[offset..offset + 4].copy_from_slice(&[(x * 25) as u8, (y * 40) as u8, 201, 255]);
-        }
-    }
-    let (upload, ptr) = host.upload_buffer(source.len() as u64).unwrap();
-    let readback = host.read_back_buffer(source.len() as u64).unwrap();
-    let list = host.new_list().unwrap();
-    unsafe {
-        std::ptr::copy_nonoverlapping(source.as_ptr(), ptr, source.len());
-        list.list.CopyBufferRegion(&readback, 0, &upload, 0, source.len() as u64);
-    }
-    list.close();
-    host.execute(&[&list]);
-    save(740000, width as u32, height as u32, pitch, true, &source);
-    let reference = std::fs::read(folder.join("frame-740000.png")).unwrap();
-    let layout = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-        Offset: 0,
-        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-            Format: DXGI_FORMAT_B8G8R8A8_UNORM, Width: width as u32, Height: height as u32,
-            Depth: 1, RowPitch: pitch as u32,
-        },
-    };
-    finish_frame(740001, readback, layout);
-    let path = folder.join("frame-740001.png");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        if std::fs::read(&path).ok().as_ref() == Some(&reference) { break; }
-        assert!(std::time::Instant::now() < deadline, "worker failed to produce byte-identical PNG");
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-}
-
 pub(crate) fn save_read_back(
     frame: u64,
     buffer: &ID3D12Resource,
@@ -621,7 +590,7 @@ fn small_float(bits: u32, man: u32) -> f32 {
 /// as channel values scaled so the largest finite one is white (single
 /// channels: lowest black, highest white, as grey). `None` for formats not
 /// handled.
-fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
+pub(crate) fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(w * h * 4);
     let px = |x: usize, y: usize, n: usize| &rows[y * pitch + x * n..][..n];
     let u16_at = |b: &[u8], i: usize| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]);
