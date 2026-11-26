@@ -19,3 +19,7 @@ This is contextual evidence from a local hybrid runtime, not a build or test of 
 Each phase averaged 3,936–3,938 draws per frame. This A/B/A provides no evidence that the ordering setting improved performance. The retained views still showed distorted clouds and blotchy hull shading; no new images are included here.
 
 An earlier, separate stationary-bridge RT comparison measured 22.75 FPS with RT off and 15.06 FPS with RT on after warm-up; all 53 builder pipelines were admitted in the RT arm. These are different conditions from the ordering A/B/A. Neither result establishes correct lighting or playable speed, and neither measures this patch. A separate 512 MiB device-local-window trial reported only 1.3–4.1 FPS near the bridge transition, never reached a steady-scene sample and later crashed during a cutscene. Those transient readings are not a matched comparison.
+
+## Later THIN-off check
+
+A matched native-4K Series X stationary-bridge run with THIN disabled averaged 16.65 FPS, versus about 17.65 FPS with THIN on; the RT builder still admitted all 53 pipelines. Cloud rings and transom patches persisted, while fixed-deck and vegetation controls showed no uniform sharpness gain. Source diagnostics are being prepared for integration; no diagnostics build or rendering fix is claimed. This observation is separate from the CPU patch and does not establish that the patch caused or fixes the remaining artifacts.
