@@ -1,0 +1,116 @@
+--- a/crates/victory-gpu/src/host/card_steps.rs
++++ b/crates/victory-gpu/src/host/card_steps.rs
+@@ -242,6 +242,45 @@
+     touches(ranges, r.0, r.1)
+ }
+
++/// With only independent fills on the card, there are no title-memory
++/// writes to order. Copies that might interact with those fills go through
++/// the full planner, including its ordering checks and refusal reasons.
++fn plan_fills(does: &[Does]) -> Option<Vec<(usize, u32)>> {
++    let mut chosen = Vec::new();
++    let mut copy_destinations = Vec::new();
++    for (index, step) in does.iter().enumerate() {
++        match *step {
++            Does::Fill { asked: true, to: true, .. } => chosen.push((index, 0)),
++            Does::Fill { asked: false, .. } | Does::Read { asked: false, .. } | Does::Refresh { .. } => {}
++            Does::Copy { dst, len, asked: false, .. } | Does::Placed { dst, len, .. } => {
++                copy_destinations.push((dst, dst + len));
++            }
++            _ => return None,
++        }
++    }
++    if chosen.len() > MOST {
++        return None;
++    }
++    if !copy_destinations.is_empty() {
++        let mut reads = Vec::new();
++        join_ranges(&mut reads, chosen.iter().map(|&(index, _)| {
++            let Does::Fill { src, len, .. } = does[index] else { unreachable!() };
++            (src, src + len)
++        }));
++        if copy_destinations.into_iter().any(|dst| touched(&reads, dst)) {
++            return None;
++        }
++    }
++    Some(chosen)
++}
++
++fn plan_fills_enabled() -> bool {
++    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_CARD_PLAN_FILLS").is_some_and(|value| value == "1"))
++}
++
++static FILL_PLAN: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
++
+ /// The steps of `does` (by place) to be done on the card, in order, each
+ /// with its level; or why not. All that are asked for, and every copy and
+ /// fill that is in the way of one that is done there: it writes what that
+@@ -689,7 +728,20 @@
+     fn take_steps(&self, written: &[(usize, usize)], runs: &[&HostList]) -> Result<Option<Taken>, &'static str> {
+         let mut spent = crate::timeline::span("steps on the card: chosen");
+         let (does, steps) = does_of(written, runs);
+-        let chosen = plan(&does, stage(), placed_order(), &mut None)?;
++        let chosen = if plan_fills_enabled() {
++            let started = std::time::Instant::now();
++            let fills = plan_fills(&does);
++            let counter = usize::from(fills.is_none());
++            let result = match fills {
++                Some(fills) => Ok(fills),
++                None => plan(&does, stage(), placed_order(), &mut None),
++            };
++            FILL_PLAN[counter].fetch_add(1, Ordering::Relaxed);
++            FILL_PLAN[2].fetch_add(started.elapsed().as_nanos() as u64, Ordering::Relaxed);
++            result?
++        } else {
++            plan(&does, stage(), placed_order(), &mut None)?
++        };
+         if chosen.is_empty() {
+             return Ok(None);
+         }
+@@ -903,6 +955,10 @@
+     if stage() == 0 {
+         return;
+     }
++    if plan_fills_enabled() {
++        let [fast, fallback, ns] = FILL_PLAN.each_ref().map(|count| count.swap(0, Ordering::Relaxed));
++        tracing::info!(fast, fallback, planner_ms = ns as f64 / 1e6 / frames, "card step fill planner");
++    }
+     let d: Vec<f64> = DONE.iter().map(|d| d.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+     tracing::info!(
+         "steps done on the card instead of waiting for flights, per frame (VICTORY_CARD_STEPS={}): {:.2} fills, {:.2} buffer \
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -2768,6 +2768,11 @@
+ fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
+     ranges.extend(more.into_iter().filter(|r| r.0 < r.1));
+     ranges.sort_unstable();
++    static COMPACT: OnceLock<bool> = OnceLock::new();
++    if *COMPACT.get_or_init(|| std::env::var_os("VICTORY_JOIN_RANGES_IN_PLACE").is_some_and(|value| value == "1")) {
++        compact_joined_ranges(ranges);
++        return;
++    }
+     let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+     for &(from, to) in ranges.iter() {
+         match out.last_mut() {
+@@ -2776,6 +2781,20 @@
+         }
+     }
+     *ranges = out;
++}
++
++fn compact_joined_ranges(ranges: &mut Vec<(usize, usize)>) {
++    let mut kept = 0;
++    for index in 0..ranges.len() {
++        let (from, to) = ranges[index];
++        if kept > 0 && from <= ranges[kept - 1].1 {
++            ranges[kept - 1].1 = ranges[kept - 1].1.max(to);
++        } else {
++            ranges[kept] = (from, to);
++            kept += 1;
++        }
++    }
++    ranges.truncate(kept);
+ }
+
+ /// Whether anything is in the air.
