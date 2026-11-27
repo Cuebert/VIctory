@@ -4,7 +4,7 @@
 //! CPU, so the machine code needs no translation. What differs is the
 //! platform underneath, so the loader's job is to:
 //!
-//! 1. [`prepare`] a lightly patched copy of the image (pure, portable): mark
+//! 1. [`prepare()`] a lightly patched copy of the image (pure, portable): mark
 //!    it as a DLL, remove its entry point and import directory, and detach
 //!    its TLS callbacks, so the Windows loader maps it, relocates it,
 //!    allocates its static TLS and registers its unwind tables, but runs
@@ -22,9 +22,13 @@
 //!    on, pass every thread start and end on to the attached images.
 
 #[cfg(windows)]
+mod console_insn;
 mod crash;
 pub mod prepare;
+pub(crate) mod publish;
 pub mod resolve;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod profile;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;
 #[cfg(windows)]
@@ -33,6 +37,8 @@ mod threads;
 mod thunks;
 #[cfg(windows)]
 mod tls;
+#[cfg(windows)]
+pub mod write_sites;
 #[cfg(windows)]
 mod windows;
 
@@ -46,6 +52,8 @@ pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use stacks::{dump_stacks, dump_stacks_on_schedule};
+#[cfg(all(windows, feature = "diagnostics"))]
+pub use profile::profile_on_schedule;
 #[cfg(windows)]
 pub use threads::disable_thread_calls;
 #[cfg(windows)]
@@ -59,3 +67,6 @@ pub use windows::{
 pub const DLL_PROCESS_ATTACH: u32 = 1;
 /// `DLL_PROCESS_DETACH`.
 pub const DLL_PROCESS_DETACH: u32 = 0;
+
+#[cfg(windows)]
+pub mod fox_resolution;

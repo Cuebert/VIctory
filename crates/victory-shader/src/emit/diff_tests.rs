@@ -141,7 +141,7 @@ const CASES: &[(&str, &str)] = &[
         }"#,
     ),
     // 16-bit outputs and inputs (one value per dword with the 2020
-    // compiler; Grand Theft Auto VI's two per dword cannot be compiled
+    // compiler; the title's two per dword cannot be compiled
     // here) and the front face.
     (
         "16-bit varyings and front face",
@@ -354,7 +354,7 @@ const CS_CASES: &[(&str, &str)] = &[
                 uint4(w * 7 + h, l + asuint(r), n * 5 + ns * 3 + st, b + raw.Load(4 * (i & 31))));
         }"#,
     ),
-    // Typed loads (`tbuffer_load_format_*`, Grand Theft Auto VI's vertex
+    // Typed loads (`tbuffer_load_format_*`, the title's vertex
     // fetch) convert by the format the instruction names: the PC reads the
     // same bytes through typed views in those formats. Channels past the
     // format's read (0, 0, 0, 1); a byte format at unaligned offsets.
@@ -587,7 +587,7 @@ const MS_CASES: &[(&str, u32, &str)] = &[
             }
         }"#,
     ),
-    // Two waves per group, as Grand Theft Auto VI's mesh programs run: the
+    // Two waves per group, as the title's mesh programs run: the
     // second wave's lanes are threads 64-127.
     (
         "two waves",
@@ -605,7 +605,7 @@ const MS_CASES: &[(&str, u32, &str)] = &[
             tris[i] = i & 1 ? uint3(c + 1, c + 10, c + 9) : uint3(c, c + 1, c + 9);
         }"#,
     ),
-    // Quad reads (DPP quad permutations on the console; Grand Theft Auto VI's
+    // Quad reads (DPP quad permutations on the console; the title's
     // tessellating mesh programs swizzle within quads too).
     (
         "quad reads",
@@ -718,9 +718,12 @@ fn translated_shaders_draw_as_pc_ones() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
     let dir = std::env::temp_dir().join(format!("victory-diff-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -874,9 +877,12 @@ fn translated_mesh_shaders_draw_as_pc_ones() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
     let dir = std::env::temp_dir().join(format!("victory-diff-ms-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -991,9 +997,12 @@ fn float_semantics_are_the_consoles() {
         eprintln!("no console compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
     let dir = std::env::temp_dir().join(format!("victory-float-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1080,9 +1089,12 @@ fn translated_compute_matches_pc() {
         eprintln!("no console or PC compiler; skipped");
         return;
     };
-    let Ok(host) = Host::new(false) else {
-        eprintln!("no SM 6.6 device; skipped");
-        return;
+    let host = match Host::new(false) {
+        Ok(host) => host,
+        Err(e) => {
+            eprintln!("no SM 6.6 device ({e}); skipped");
+            return;
+        }
     };
     let dir = std::env::temp_dir().join(format!("victory-diff-cs-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -1152,7 +1164,7 @@ fn translated_compute_matches_pc() {
             typed_view(DXGI_FORMAT_R8_UNORM, 1),
             typed_view(DXGI_FORMAT_R16_FLOAT, 2),
             typed_view(DXGI_FORMAT_R8G8B8A8_SNORM, 4),
-            View::Cube(4, &cube_texels),
+            View::Cube(4, 1, &cube_texels),
         ])
         .collect();
     let root_cbv = floats(64, -0.125);
@@ -1216,12 +1228,43 @@ fn translated_compute_matches_pc() {
         let mut root_views: Vec<(u8, bool)> = cs_c.root_cbvs.iter().map(|&s| (s, false)).collect();
         root_views.extend(cs_c.root_srvs.iter().map(|&s| (s, true)));
         root_views.sort_unstable();
+        let view_strides: Vec<u32> = views
+            .iter()
+            .map(|v| match *v {
+                View::RawUav(_) => 1,
+                View::HalfUav(_) => 8,
+                View::Buffer { stride, .. } => match stride {
+                    Stride::Raw => 1,
+                    Stride::Typed => 16,
+                    Stride::Structured(s) => s,
+                    Stride::Format(f, bytes) => {
+                        let kind = match f.0 as u32 {
+                            3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => {
+                                super::VIEW_INTEGER
+                            }
+                            4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => {
+                                super::VIEW_INTEGER | super::VIEW_SIGNED
+                            }
+                            _ => 0,
+                        };
+                        bytes | kind
+                    }
+                },
+                _ => 0,
+            })
+            .collect();
         for (n, (slot, srv)) in root_views.into_iter().enumerate() {
-            assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
-            let data = if srv {
-                root_srv.clone()
+            let data = if srv
+                && (slot == super::SLOT_STRIDES || slot == super::SLOT_TABLE_STRIDES)
+            {
+                view_strides.clone()
             } else {
-                root_cbv.clone()
+                assert_eq!(slot, 4 + u8::from(srv), "{name}: root view");
+                if srv {
+                    root_srv.clone()
+                } else {
+                    root_cbv.clone()
+                }
             };
             roots.push((1 + n as u32, Root::View { srv, data }));
         }
